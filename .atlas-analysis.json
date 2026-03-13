@@ -1,0 +1,102 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "UNC",
+  "projectDescription": "Universal Neural Compiler that compiles HuggingFace transformer models into optimized native Metal inference binaries for Apple Silicon.",
+  "theme": "aspen",
+  "primaryColor": "#4A5FD9",
+  "lightColor": "#7B8EF0",
+  "darkColor": "#2A3FA9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/compilation-modes",
+              "concepts/quantization",
+              "concepts/ir-graph"
+            ]
+          },
+          {
+            "group": "CLI Reference",
+            "pages": [
+              "cli/compile",
+              "cli/run",
+              "cli/serve",
+              "cli/inspect",
+              "cli/list-architectures"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/model-compilation",
+              "guides/supported-models",
+              "guides/quantization-options",
+              "guides/performance-tuning",
+              "guides/energy-efficiency"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Advanced",
+        "groups": [
+          {
+            "group": "Compiler Internals",
+            "pages": [
+              "internals/compiler-pipeline",
+              "internals/optimization-passes",
+              "internals/memory-planning",
+              "internals/kernel-matching"
+            ]
+          },
+          {
+            "group": "Metal Backend",
+            "pages": [
+              "metal/overview",
+              "metal/kernels",
+              "metal/fusion-patterns"
+            ]
+          },
+          {
+            "group": "Development",
+            "pages": [
+              "development/project-structure",
+              "development/building-from-source",
+              "development/benchmarking"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Compiles HuggingFace models to native Metal binaries",
+    "1.35x faster than mlx-lm with 25% less GPU power",
+    "Multiple quantization formats (F16, Q8_0, Q4_0)",
+    "Support for LLaMA, Mistral, Qwen, Phi, Gemma architectures",
+    "JIT and AOT compilation modes",
+    "Advanced compiler optimizations (fusion, memory planning)",
+    "Superior energy efficiency (1.7x better than mlx-lm)"
+  ],
+  "publicApiSurface": [
+    "unc compile --model <model> --quant <format> --output <path>",
+    "unc compile --model <model> --binary",
+    "unc run <unc_file> --prompt <text> --max-tokens <n>",
+    "unc serve <unc_file> --port <port>",
+    "unc inspect <unc_file> --dump-ir",
+    "unc list-architectures"
+  ]
+}
