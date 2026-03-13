@@ -1,0 +1,183 @@
+---
+title: "Compiler Pipeline"
+description: "Understanding the UNC compilation pipeline from IR construction to executable artifacts"
+---
+
+## Overview
+
+The UNC compiler transforms neural network graphs through a multi-pass optimization pipeline. The compilation flow follows three major stages:
+
+1. **Optimization passes** - Graph transformations and fusion
+2. **Kernel matching** - Selecting optimal compute kernels
+3. **Memory planning** - Static allocation with buffer aliasing
+
+## Pass Pipeline Architecture
+
+The compilation pipeline is managed by the `PassPipeline` struct, which orchestrates a series of transformations on the computation graph.
+
+### Pipeline Stages
+
+The default pipeline executes passes in this order:
+
+```rust
+PassPipeline {
+    passes: vec![
+        PassKind::WeightBindingResolution,
+        PassKind::DeadCodeElimination,
+        PassKind::QKVFusion,
+        PassKind::ElementwiseFusion,
+        PassKind::AttentionFusion,
+        PassKind::DeadCodeElimination,
+        PassKind::DualPathInsertion,
+        PassKind::KernelMatching,
+        PassKind::LayoutOptimization,
+        PassKind::MemoryPlanning,
+        PassKind::Scheduling,
+    ],
+}
+```
+
+<Note>
+Dead Code Elimination runs twice: once after initial construction, and again after fusion passes to clean up any nodes orphaned by fusion.
+</Note>
+
+## Pipeline Execution
+
+The pipeline runner in `src/compile/mod.rs` executes each pass sequentially:
+
+```rust
+pub fn run(
+    &self,
+    mut graph: CompGraph,
+    registry: &KernelRegistry,
+    target: &Target,
+    weight_files: &[WeightFile],
+) -> anyhow::Result<CompilationResult> {
+    let nodes_before = graph.num_nodes();
+    let mut stats = CompilationStats {
+        nodes_before,
+        ..Default::default()
+    };
+
+    for pass in &self.passes {
+        log::debug!("Running pass: {:?}", pass);
+        match pass {
+            PassKind::WeightBindingResolution => {
+                passes::weight_binding::resolve_weight_bindings(
+                    &mut graph, 
+                    weight_files
+                ).context("WeightBindingResolution")?;
+            }
+            PassKind::DeadCodeElimination => {
+                passes::dce::eliminate_dead_code(&mut graph);
+            }
+            // ... more passes
+        }
+    }
+}
+```
+
+### Weight Binding Resolution
+
+The first pass scans safetensors file headers to resolve weight tensor locations without loading data into memory. This fills in byte offsets and sizes for all weight tensors.
+
+<CodeGroup>
+```rust Weight Binding Process
+// Build a map: tensor_name -> (byte_offset, byte_size, shape, dtype)
+let mut name_map: HashMap<String, (usize, usize, Vec<usize>, DType)> = HashMap::new();
+let mut cumulative_file_offset: usize = 0;
+
+for wf in weight_files {
+    match wf {
+        WeightFile::Safetensors { path, .. } => {
+            let data = std::fs::read(path)?;
+            let file_size = data.len();
+            let tensors = SafeTensors::deserialize(&data)?;
+            
+            // Compute offsets within the file
+            let base_ptr = data.as_ptr() as usize;
+            
+            for (name, view) in tensors.tensors() {
+                let local_offset = tensor_data.as_ptr() as usize - base_ptr;
+                let byte_size = tensor_data.len();
+                // Global offset across all shards
+                let byte_offset = cumulative_file_offset + local_offset;
+                name_map.insert(name.to_string(), 
+                    (byte_offset, byte_size, shape, dtype));
+            }
+            
+            cumulative_file_offset += file_size;
+        }
+    }
+}
+```
+</CodeGroup>
+
+This enables zero-copy weight loading via memory mapping at runtime.
+
+## Compilation Results
+
+The pipeline produces a `CompilationResult` containing:
+
+```rust
+pub struct CompilationResult {
+    pub graph: CompGraph,
+    pub memory_plan: MemoryPlan,
+    pub target: Target,
+    pub stats: CompilationStats,
+}
+
+pub struct CompilationStats {
+    pub nodes_before: usize,
+    pub nodes_after: usize,
+    pub unique_kernels: usize,
+    pub fusions_applied: usize,
+    pub estimated_flops_per_token: f64,
+    pub peak_activation_bytes: usize,
+    pub kernel_launches_per_forward: usize,
+}
+```
+
+These statistics help diagnose compilation effectiveness:
+
+- **nodes_before/after**: Shows reduction from fusion and DCE
+- **unique_kernels**: Number of distinct kernel implementations needed
+- **fusions_applied**: Count of successful pattern matches
+- **peak_activation_bytes**: Memory footprint after aliasing
+
+## Compiled Artifacts
+
+After the pass pipeline completes, code emission generates target-specific artifacts:
+
+```rust
+pub enum CompiledArtifact {
+    Metal {
+        metallib_path: String,
+        orchestrator_source: String,
+        weight_layout: WeightFileLayout,
+    },
+}
+```
+
+For Metal targets, this includes:
+- Compiled `.metallib` shader library
+- Swift orchestrator source code
+- Weight file layout with tensor offsets
+
+<Info>
+The orchestrator source is generated as Swift code that dispatches kernels in topological order, handling dynamic branching between prefill and decode paths.
+</Info>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Optimization Passes" icon="wand-magic-sparkles" href="/internals/optimization-passes">
+    Learn about fusion patterns and graph optimizations
+  </Card>
+  <Card title="Kernel Matching" icon="microchip" href="/internals/kernel-matching">
+    Understand how kernels are selected for each operation
+  </Card>
+  <Card title="Memory Planning" icon="memory" href="/internals/memory-planning">
+    Explore static allocation and buffer aliasing
+  </Card>
+</CardGroup>

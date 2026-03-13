@@ -1,0 +1,313 @@
+---
+title: "Kernel Matching"
+description: "How UNC selects optimal compute kernels for each graph operation"
+---
+
+## Overview
+
+Kernel matching assigns a concrete Metal shader implementation to each node in the computation graph. The kernel registry maintains a database of available kernels, and the matching pass selects the best implementation for each operation based on operation type, tensor shapes, data types, and target device.
+
+## Kernel Registry
+
+The `KernelRegistry` catalogs all available kernel implementations. Each kernel provides:
+
+- **Operation pattern**: Which IR operations it implements
+- **Constraints**: Shape requirements, data type support
+- **Dispatch configuration**: Threadgroup sizes, shared memory
+- **Cost model**: Estimated latency for performance tuning
+
+## Matching Algorithm
+
+From `src/compile/passes/kernel_matching.rs`:
+
+```rust
+pub fn match_kernels(
+    graph: &mut CompGraph,
+    registry: &KernelRegistry,
+    target: &Target,
+) -> anyhow::Result<usize> {
+    let mut matched = 0usize;
+    let mut unmatched = 0usize;
+    let mut unique_kernels: HashSet<KernelId> = HashSet::new();
+
+    let node_ids: Vec<_> = graph.nodes.iter().map(|n| n.id).collect();
+
+    for node_id in node_ids {
+        let node = graph.node(node_id);
+
+        // Skip zero-compute ops (reshape, transpose)
+        if node.op.is_zero_compute() {
+            continue;
+        }
+
+        // Gather input tensors and output shape
+        let input_ids = node.inputs.clone();
+        let output_id = node.output;
+        let op = node.op.clone();
+
+        let input_tensors: Vec<&TensorRef> = input_ids
+            .iter()
+            .filter_map(|id| graph.tensors.get(id))
+            .collect();
+
+        let output_shape = graph.tensors.get(&output_id)
+            .map(|t| t.shape.clone());
+        let output_shape = match output_shape {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let mp = Some(&graph.metadata.params);
+        if let Some(mut km) = registry.find_best(
+            &op, 
+            &input_tensors, 
+            &output_shape, 
+            target, 
+            mp
+        ) {
+            unique_kernels.insert(km.kernel.id);
+            // ... assign kernel to node
+            matched += 1;
+        } else {
+            log::warn!("No kernel found for op {:?}", op);
+            unmatched += 1;
+        }
+    }
+
+    Ok(unique_kernels.len())
+}
+```
+
+<Note>
+Zero-compute operations like reshape and transpose are view operations that don't require kernel execution - they just update metadata.
+</Note>
+
+## Dual-Path Kernel Selection
+
+Matrix multiplication operations need different kernels for prefill (GEMM) and decode (GEMV) phases:
+
+```rust
+let path = if is_gemm_op(&op) {
+    // Try to find the corresponding GEMV kernel
+    let gemv_op = to_gemv_op(&op);
+    if let Some(mut decode_km) = gemv_op.and_then(|gop| {
+        registry.find_best(&gop, &input_tensors, &output_shape, target, mp)
+    }) {
+        // Dynamic shared memory: GEMV uses K*2 bytes for activation cache
+        if decode_km.dispatch.shared_memory_bytes > 0 {
+            let k_dim = input_tensors.first()
+                .and_then(|t| t.shape.0.first())
+                .map(|d| d.max_value())
+                .unwrap_or(0);
+            decode_km.dispatch.shared_memory_bytes = (k_dim * 2) as u32;
+        }
+        unique_kernels.insert(decode_km.kernel.id);
+        ExecutionPath::Dual {
+            prefill_kernel: km.kernel.id,
+            prefill_kernel_name: km.kernel.name.clone(),
+            prefill_dispatch: Box::new(km.dispatch.clone()),
+            decode_kernel: decode_km.kernel.id,
+            decode_kernel_name: decode_km.kernel.name.clone(),
+            decode_dispatch: Box::new(decode_km.dispatch),
+        }
+    } else {
+        ExecutionPath::Prefill
+    }
+} else {
+    ExecutionPath::Unified
+}
+```
+
+### Operation Mapping
+
+The matcher converts GEMM operations to GEMV equivalents:
+
+```rust
+fn is_gemm_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::MatMul | 
+        Op::BatchMatMul { .. } | 
+        Op::LogitProjection
+    )
+}
+
+fn to_gemv_op(op: &Op) -> Option<Op> {
+    match op {
+        Op::MatMul | Op::LogitProjection => Some(Op::MatVec),
+        Op::QuantizedMatMul { weight_dtype } => {
+            Some(Op::QuantizedMatVec { weight_dtype: *weight_dtype })
+        }
+        _ => None,
+    }
+}
+```
+
+<Info>
+Quantized operations preserve the weight data type through the GEMM to GEMV conversion, ensuring the decode kernel uses the correct dequantization strategy.
+</Info>
+
+## Dynamic Shared Memory
+
+Some kernels use dynamic shared memory (threadgroup memory in Metal) sized based on problem dimensions:
+
+```rust
+// Dynamic shared memory for standalone GEMV
+if matches!(op, Op::MatVec | Op::QuantizedMatVec { .. }) 
+    && km.dispatch.shared_memory_bytes > 0 
+{
+    let k_dim = input_tensors.first()
+        .and_then(|t| t.shape.0.first())
+        .map(|d| d.max_value())
+        .unwrap_or(0);
+    km.dispatch.shared_memory_bytes = (k_dim * 2) as u32;
+}
+```
+
+For GEMV kernels, this allocates K×2 bytes of threadgroup memory to cache the activation vector (one f16 = 2 bytes per element).
+
+### Metal Threadgroup Memory
+
+Metal devices have 32KB or 64KB of threadgroup memory. The compiler ensures shared memory allocations fit within device limits:
+
+```metal
+threadgroup half activation_cache[K]; // Size determined at runtime
+```
+
+## Kernel Assignment
+
+Once a kernel is selected, it's attached to the node:
+
+```rust
+let kernel_name = km.kernel.name.clone();
+let node = graph.node_mut(node_id);
+node.kernel = Some(KernelAssignment {
+    kernel_id: km.kernel.id,
+    kernel_name,
+    dispatch: km.dispatch,
+    path,
+});
+node.estimated_cost = Some(km.estimated_cost);
+```
+
+The `KernelAssignment` contains:
+
+```rust
+pub struct KernelAssignment {
+    pub kernel_id: KernelId,
+    pub kernel_name: String,
+    pub dispatch: DispatchConfig,
+    pub path: ExecutionPath,
+}
+
+pub struct DispatchConfig {
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_memory_bytes: u32,
+}
+
+pub enum ExecutionPath {
+    Unified,
+    Prefill,
+    Dual {
+        prefill_kernel: KernelId,
+        prefill_kernel_name: String,
+        prefill_dispatch: Box<DispatchConfig>,
+        decode_kernel: KernelId,
+        decode_kernel_name: String,
+        decode_dispatch: Box<DispatchConfig>,
+    },
+}
+```
+
+## Matching Statistics
+
+The pass reports matching results:
+
+```rust
+log::info!(
+    "Kernel matching: {matched} matched, {unmatched} unmatched, {} unique kernels",
+    unique_kernels.len()
+);
+```
+
+Example output:
+```
+Kernel matching: 428 matched, 0 unmatched, 47 unique kernels
+```
+
+<Warning>
+If any operations remain unmatched, compilation fails. All graph operations must have corresponding kernel implementations for the target device.
+</Warning>
+
+## Registry Lookup Strategy
+
+The `find_best` method in the kernel registry:
+
+1. **Filter by operation**: Only consider kernels that implement the requested op
+2. **Check constraints**: Verify tensor shapes and data types are supported
+3. **Evaluate cost model**: If multiple kernels match, select the one with lowest estimated cost
+4. **Return dispatch config**: Compute grid/block dimensions based on actual tensor sizes
+
+### Cost Models
+
+Kernels provide cost estimates based on:
+- **Arithmetic intensity**: FLOPS per byte of memory traffic
+- **Occupancy**: How well the kernel utilizes GPU cores
+- **Memory patterns**: Coalesced vs. strided access
+
+For example, a tiled GEMM kernel might estimate:
+
+```rust
+fn estimate_cost(m: usize, n: usize, k: usize) -> f64 {
+    let flops = (2 * m * n * k) as f64;
+    let memory_bytes = ((m * k + k * n + m * n) * 2) as f64; // f16
+    let arithmetic_intensity = flops / memory_bytes;
+    
+    // Lower is better: nanoseconds
+    memory_bytes / peak_bandwidth() + flops / peak_flops()
+}
+```
+
+## Dispatch Configuration
+
+The kernel matcher computes Metal dispatch parameters:
+
+```rust
+pub struct DispatchConfig {
+    pub grid: [u32; 3],        // Threadgroup grid dimensions
+    pub block: [u32; 3],       // Threads per threadgroup
+    pub shared_memory_bytes: u32,
+}
+```
+
+For a matrix multiplication C = A × B with A:[M×K], B:[K×N]:
+
+```rust
+let tile_m = 64;
+let tile_n = 64;
+let grid = [
+    (n + tile_n - 1) / tile_n,  // Columns of tiles
+    (m + tile_m - 1) / tile_m,  // Rows of tiles
+    1
+];
+let block = [256, 1, 1];  // Threads per threadgroup
+```
+
+<Tip>
+The dispatch configuration is computed at compile time based on symbolic shape bounds, ensuring the grid is large enough for all possible runtime sizes.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Compiler Pipeline" icon="diagram-project" href="/internals/compiler-pipeline">
+    Understanding the overall compilation flow
+  </Card>
+  <Card title="Optimization Passes" icon="wand-magic-sparkles" href="/internals/optimization-passes">
+    Learn about graph transformations
+  </Card>
+  <Card title="Memory Planning" icon="memory" href="/internals/memory-planning">
+    Explore static allocation strategies
+  </Card>
+</CardGroup>

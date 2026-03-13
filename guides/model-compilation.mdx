@@ -1,0 +1,212 @@
+---
+title: Model Compilation
+description: Step-by-step guide to compiling HuggingFace transformer models into optimized native Metal binaries
+---
+
+# Model Compilation
+
+UNC compiles HuggingFace transformer models into optimized native Metal inference binaries. This guide walks you through the compilation process, from basic usage to advanced options.
+
+## Overview
+
+UNC supports two compilation modes:
+
+- **JIT (Just-In-Time)**: Creates a `.unc` bundle that compiles via clang at first run and caches thereafter. Ideal for development and iteration.
+- **AOT (Ahead-Of-Time)**: Creates a standalone Mach-O binary with embedded weights and zero dependencies. Perfect for deployment and distribution.
+
+## Prerequisites
+
+<Steps>
+  <Step title="Install Rust toolchain">
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+  </Step>
+
+  <Step title="Install Xcode Command Line Tools (macOS)">
+    ```bash
+    xcode-select --install
+    ```
+  </Step>
+
+  <Step title="Build UNC">
+    ```bash
+    git clone <repo-url> && cd unc
+    cargo build --release
+    ```
+  </Step>
+</Steps>
+
+## Compiling Your First Model
+
+<Steps>
+  <Step title="Compile TinyLlama with Q4_0 quantization">
+    ```bash
+    unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama
+    ```
+    
+    This creates a `tinyllama.unc` bundle (544 KB) that references the HuggingFace weights.
+  </Step>
+
+  <Step title="Run inference">
+    ```bash
+    unc run ./tinyllama.unc --prompt "The history of" --max-tokens 200
+    ```
+    
+    On first run, the bundle is JIT-compiled via clang (~2s). Subsequent runs use the cached binary (~1.7s init).
+  </Step>
+</Steps>
+
+<Tip>
+  JIT mode is perfect for development - the small bundle size makes it easy to experiment with different quantization levels without duplicating multi-gigabyte weight files.
+</Tip>
+
+## Compilation Modes
+
+### JIT Mode (Default)
+
+Creates a `.unc` bundle with Metal shader sources and model graph metadata. The bundle is compiled at first run and cached.
+
+```bash
+unc compile --model Qwen/Qwen3-4B --quant q4-0 -o ./qwen3
+```
+
+**Characteristics:**
+- Output: `.unc` bundle (544 KB)
+- Init time: ~2s (first run), ~1.7s (cached)
+- Dependencies: clang (for JIT compilation)
+- Use case: Development, iteration, testing
+
+### AOT Mode
+
+Creates a standalone Mach-O binary with embedded weights - zero external dependencies.
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 --binary -o ./tinyllama
+```
+
+**Characteristics:**
+- Output: Self-contained binary (2.1 GB for TinyLlama Q4_0)
+- Init time: ~1.5s
+- Dependencies: None
+- Use case: Deployment, distribution, production
+
+<Warning>
+  AOT binaries are significantly larger (2+ GB) because weights are embedded. Use JIT mode during development and AOT only for final deployment.
+</Warning>
+
+## Compilation Examples
+
+### Small Model (TinyLlama 1.1B)
+
+```bash
+# Q4_0: Maximum speed (152 tok/s)
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama-q4
+
+# Q8_0: Balanced (76.6 tok/s)
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q8-0 -o ./tinyllama-q8
+
+# F16: Full precision (47.9 tok/s)
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant f16 -o ./tinyllama-f16
+```
+
+### Medium Model (Qwen3-4B)
+
+```bash
+# Q4_0 quantization (38.7 tok/s on M1 Pro)
+unc compile --model Qwen/Qwen3-4B --quant q4-0 -o ./qwen3
+
+# AOT binary for deployment
+unc compile --model Qwen/Qwen3-4B --quant q4-0 --binary -o ./qwen3-standalone
+```
+
+### Running Compiled Models
+
+```bash
+# Basic inference
+unc run ./model.unc --prompt "Hello, world!"
+
+# Control generation length
+unc run ./model.unc --prompt "The history of" --max-tokens 500
+
+# Interactive mode (if supported)
+unc run ./model.unc --interactive
+```
+
+## Understanding the Compilation Process
+
+UNC's compilation pipeline consists of several stages:
+
+<Steps>
+  <Step title="Frontend: Parse HuggingFace Model">
+    - Reads `config.json` to determine architecture (LLaMA, Mistral, Qwen, Phi, Gemma)
+    - Loads weights from safetensors files
+    - Validates model configuration
+  </Step>
+
+  <Step title="IR Graph Construction">
+    - Builds hardware-agnostic tensor graph
+    - Creates ops: `BatchMatMul`, `QuantizedMatVec`, `RMSNorm`, `RoPE`, `SDPA`, `SwiGLU`, etc.
+    - Graph is target-independent (same graph for Metal, CUDA, ROCm, WASM)
+  </Step>
+
+  <Step title="Compiler Optimization Passes">
+    - Weight binding resolution
+    - Dead code elimination
+    - Fusion: QKV, Gate+Up, SwiGLU, Add+RMSNorm, RoPE+KV
+    - Dual-path GEMM/GEMV selection
+    - Memory planning with buffer aliasing
+  </Step>
+
+  <Step title="Quantization">
+    - Converts weights from F16/BF16 to target precision
+    - Supports F16 (no quantization), Q8_0 (8-bit), Q4_0 (4-bit)
+    - Applied during compilation, not at runtime
+  </Step>
+
+  <Step title="Code Generation">
+    - Generates Metal shader code for all operations
+    - Creates orchestrator (Objective-C++) to manage execution
+    - Packages into `.unc` bundle or standalone binary
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+### Compilation Fails
+
+<Note>
+  Ensure your HuggingFace model path is correct and you have network access to download weights.
+</Note>
+
+```bash
+# Verify model exists
+unc list-architectures
+
+# Check HuggingFace model page
+# https://huggingface.co/<model-name>
+```
+
+### Out of Memory During Compilation
+
+UNC loads weights in BF16 then quantizes during initialization. Large models may require 16GB+ RAM.
+
+```bash
+# Monitor memory during compilation
+top -pid $(pgrep unc)
+```
+
+### JIT Compilation Fails
+
+Ensure clang is available:
+
+```bash
+which clang
+# Should output: /usr/bin/clang
+```
+
+## Next Steps
+
+- [Quantization Options](/guides/quantization-options) - Compare F16, Q8_0, and Q4_0 performance
+- [Performance Tuning](/guides/performance-tuning) - Optimize throughput for your hardware
+- [Supported Models](/guides/supported-models) - See all supported architectures

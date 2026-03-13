@@ -1,97 +1,85 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "UNC — Universal Neural Compiler"
+description: "Compile HuggingFace transformer models into optimized native Metal inference binaries for Apple Silicon"
 ---
 
-## Setting up
+<Note>
+  **1.35x faster** than mlx-lm while using **25% less GPU power** — compile HuggingFace models to native Metal binaries with zero runtime overhead.
+</Note>
 
-Get your documentation site up and running in minutes.
+## Overview
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+UNC (Universal Neural Compiler) transforms HuggingFace transformer models into highly optimized native inference binaries for Apple Silicon. By compiling models ahead-of-time or just-in-time, UNC eliminates Python runtime overhead and delivers near-hardware-limit performance.
 
-## Make it yours
+### Performance Highlights
 
-Design a docs site that looks great and empowers your users.
+Running TinyLlama 1.1B on Apple M1 Pro (Q4_0 quantization):
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+- **152 tok/s** vs 113 tok/s (mlx-lm) — 1.35x faster
+- **11.3W GPU power** vs 14.1W — 25% less power consumption
+- **74 mJ/token** vs 125 mJ/token — 1.7x better energy efficiency
+- **5.3B CPU instructions** vs 31.4B — 8.4x fewer instructions
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Native Metal Compilation" icon="microchip">
+    Compiles to optimized Metal GPU kernels with zero Python runtime overhead
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Multiple Quantization Formats" icon="compress">
+    Support for F16, Q8_0, and Q4_0 quantization with configurable precision-speed tradeoffs
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Dual Compilation Modes" icon="bolt">
+    JIT bundles for fast iteration or AOT standalone binaries for deployment
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Advanced Optimizations" icon="gauge-high">
+    Kernel fusion, memory planning, dual-path dispatch, and PSQ pipeline optimizations
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Supported Architectures
 
-Everything you need to create world-class documentation.
+UNC supports the most popular transformer architectures:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+- **LLaMA** (LLaMA, LLaMA-2, LLaMA-3)
+- **Mistral** (Mistral, Mixtral)
+- **Qwen** (Qwen, Qwen-2, Qwen-3)
+- **Phi** (Phi-2, Phi-3)
+- **Gemma** (Gemma, Gemma-2)
 
-## Need inspiration?
+## Quick Example
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+```bash
+# Compile a model from HuggingFace
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama
+
+# Run inference
+unc run ./tinyllama.unc --prompt "The history of" --max-tokens 200
+```
+
+## Get Started
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install UNC and set up your development environment
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Compile and run your first model in minutes
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/compile">
+    Explore all available commands and options
+  </Card>
+  <Card title="Performance Tuning" icon="sliders" href="/guides/performance-tuning">
+    Optimize your models for maximum throughput and efficiency
+  </Card>
+</CardGroup>
+
+## Architecture
+
+UNC follows a traditional compiler architecture with a hardware-agnostic intermediate representation:
+
+```
+HuggingFace model → Frontend → IR Graph → Compiler → Metal/CUDA/ROCm/WASM → Native binary
+```
+
+The IR supports typed tensor operations including `BatchMatMul`, `QuantizedMatVec`, `RMSNorm`, `RoPE`, `SDPA`, `SwiGLU`, and more. Compiler passes perform optimizations like QKV fusion, elementwise fusion, memory planning, and kernel matching before lowering to target-specific code.

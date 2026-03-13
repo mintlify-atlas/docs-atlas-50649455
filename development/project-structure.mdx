@@ -1,0 +1,218 @@
+---
+title: "Project Structure"
+description: "Understanding UNC's codebase organization and module layout"
+---
+
+UNC follows a modular compiler architecture with clear separation between frontend parsing, intermediate representation, optimization, and code generation.
+
+## Source Directory Layout
+
+```
+src/
+  frontend/    HuggingFace config parsing, model templates
+  ir/          Typed tensor IR (ops, graph, types)
+  compile/     Optimization passes, memory planner
+  kernel/      Kernel registry, Metal kernel definitions
+  emit/        Metal orchestrator codegen, AOT binary emission
+  runtime/     JIT compilation, weight loading, tokenizer
+  target/      Apple Silicon target detection
+  unc_format/  .unc bundle serialization
+```
+
+## Module Overview
+
+<Steps>
+
+### Frontend (`src/frontend/`)
+
+Handles HuggingFace model ingestion and IR graph construction.
+
+**Key components:**
+- `config.rs` - Parses `config.json` from HuggingFace models
+- `huggingface.rs` - Safetensors weight loading and model metadata
+- `templates/` - Architecture-specific graph builders:
+  - `llama.rs` - LLaMA, Mistral variants
+  - `qwen.rs` - Qwen models with QKNorm
+  - `phi.rs` - Phi architectures
+  - `gemma.rs` - Gemma models
+
+**Supported architectures:**
+```bash
+unc list-architectures
+```
+
+LLaMA, Mistral, Qwen, Phi, Gemma.
+
+### IR (`src/ir/`)
+
+Hardware-agnostic typed tensor graph representation.
+
+**Key components:**
+- `types.rs` - Tensor types, shapes, data types (F16, BF16, Q4_0, Q8_0)
+- `ops.rs` - IR operations:
+  - `BatchMatMul`, `QuantizedMatVec`
+  - `RMSNorm`, `LayerNorm`, `QKNorm`
+  - `RoPE`, `SDPA` (Scaled Dot-Product Attention)
+  - `SwiGLU`, `KVCacheAppend`, `Gather`
+- `graph.rs` - Computation graph data structure with topological ordering
+- `printer.rs` - IR visualization and debugging
+
+<Note>
+The IR is target-independent — the same graph can be lowered to Metal (current), CUDA, ROCm, WASM, or CPU-only backends.
+</Note>
+
+### Compile (`src/compile/`)
+
+Optimization pipeline and memory planning.
+
+**Optimization passes:**
+- `passes/weight_binding.rs` - Resolve weight tensor references from safetensors
+- `passes/dce.rs` - Dead code elimination
+- `passes/qkv_fusion.rs` - Fuse Query/Key/Value projections
+- `passes/elementwise_fusion.rs` - Fuse Add+RMSNorm, RoPE+KV operations
+- `passes/dual_path.rs` - Insert GEMM/GEMV dual-path dispatches for batch vs decode
+- `passes/kernel_matching.rs` - Match IR ops to target kernels
+- `passes/barrier_analysis.rs` - Compute synchronization barriers for Metal
+
+**Memory planning:**
+- `memory.rs` - Buffer aliasing and activation memory layout
+
+**Pass pipeline:**
+```
+1. Weight binding
+2. Dead code elimination
+3. QKV fusion
+4. Elementwise fusion (Add+RMSNorm, RoPE+KV)
+5. Attention fusion
+6. Dead code elimination (cleanup)
+7. Dual-path insertion (GEMM/GEMV)
+8. Kernel matching
+9. Layout optimization
+10. Memory planning
+11. Scheduling
+```
+
+### Kernel (`src/kernel/`)
+
+Kernel registry and Metal shader integration.
+
+**Key components:**
+- `registry.rs` - Kernel catalog with signature matching
+- `metal_mlx.rs` - Metal kernel definitions and MLX integration
+
+**Metal kernel sources** (compiled at build time via `build.rs`):
+```
+kernel_sources/
+  metal/
+    unc_kernels/   Custom Metal shaders (fused GEMV, SDPA, RoPE, RMSNorm)
+    upstream_mlx/  MLX reference kernels (QMV, sdpa_vector headers)
+```
+
+### Emit (`src/emit/`)
+
+Code generation for Metal orchestrators and AOT binaries.
+
+**Key components:**
+- `metal.rs` - Generates Objective-C orchestrator code with Metal dispatch calls
+- `aot.rs` - Produces standalone Mach-O binaries with embedded weights
+
+**Output modes:**
+
+| Mode | Output | Use case |
+|------|--------|----------|
+| JIT (default) | `.unc` bundle — JIT-compiled via clang at first run, cached thereafter | Development, iteration |
+| AOT (`--binary`) | Standalone Mach-O with embedded weights — zero dependencies | Deployment, distribution |
+
+### Runtime (`src/runtime/`)
+
+JIT compilation, weight loading, and tokenizer integration.
+
+**Key components:**
+- JIT clang invocation and dylib caching
+- Safetensors memory-mapped weight loading
+- HuggingFace tokenizer integration (fancy-regex support)
+- Metal device and command queue management
+
+**C runtime shim** (compiled at build time via `build.rs`):
+```
+runtime/
+  runtime.c      Core JIT execution harness
+  api_server.c   OpenAI-compatible API server (planned)
+  repl.c         Interactive REPL (planned)
+```
+
+### Target (`src/target/`)
+
+Apple Silicon device detection and capability queries.
+
+**Detected properties:**
+- GPU core count
+- Memory bandwidth
+- Metal feature set version
+- Recommended tile sizes for matrix operations
+
+### UNC Format (`src/unc_format/`)
+
+`.unc` bundle serialization format.
+
+**Bundle contents:**
+- Serialized IR graph (bincode)
+- Compilation metadata (target, quantization, max sequence length)
+- Weight tensor layout map
+- Generated Metal orchestrator source
+- CRC32 integrity checksum
+
+</Steps>
+
+## Build System
+
+The `build.rs` script:
+1. Compiles C runtime shim (`runtime/*.c`) via `cc` crate
+2. Compiles Metal shaders (`.metal` → `.air` → `.metallib`) via `xcrun` on macOS
+3. Embeds metallib path as `UNC_METALLIB_PATH` environment variable
+
+## CLI Entry Point
+
+The `src/main.rs` file provides the command-line interface:
+
+```rust
+unc compile --model <model-id> --quant <precision> -o <output>
+unc run <unc-file> --prompt "text" --max-tokens 200
+unc serve <unc-file> --port 8080
+unc inspect <unc-file> --dump-ir
+unc list-architectures
+```
+
+## Dependencies
+
+<CodeGroup>
+
+```toml Cargo.toml
+[dependencies]
+clap = "4"              # CLI parsing
+hf-hub = "0.5"          # HuggingFace model downloads
+safetensors = "0.4"     # Weight format
+serde_json = "1"        # Config parsing
+memmap2 = "0.9"         # Memory-mapped weights
+tokenizers = "0.21"     # HuggingFace tokenizers
+libloading = "0.8"      # JIT dylib loading
+anyhow = "1"            # Error handling
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"          # Metal API bindings
+objc = "0.2"            # Objective-C interop
+core-foundation = "0.10"
+```
+
+</CodeGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Building from Source" icon="hammer" href="/development/building-from-source">
+    Compile UNC locally with Rust and Xcode tools
+  </Card>
+  <Card title="Benchmarking" icon="chart-line" href="/development/benchmarking">
+    Run performance benchmarks and measure resource usage
+  </Card>
+</CardGroup>

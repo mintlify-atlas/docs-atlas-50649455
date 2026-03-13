@@ -1,0 +1,744 @@
+---
+title: Metal Kernel Reference
+description: Complete reference for all Metal kernels in the UNC compiler
+---
+
+## Kernel Categories
+
+UNC provides 70+ optimized Metal kernels organized by operation class:
+
+<CardGroup cols={3}>
+  <Card title="Matrix Ops" icon="grid">
+    GEMM, GEMV, Quantized MatMul
+  </Card>
+  <Card title="Attention" icon="eye">
+    SDPA, Flash Attention, KV Cache
+  </Card>
+  <Card title="Normalization" icon="wave-square">
+    RMSNorm, LayerNorm, QKNorm
+  </Card>
+  <Card title="Positional" icon="compass">
+    RoPE, Rotary Embeddings
+  </Card>
+  <Card title="Activation" icon="bolt">
+    SiLU, GELU, ReLU, SwiGLU
+  </Card>
+  <Card title="Memory" icon="database">
+    Gather, KV Append, Softmax
+  </Card>
+</CardGroup>
+
+---
+
+## Matrix Operations
+
+### GEMM (General Matrix Multiply) — Prefill
+
+**Steel GEMM kernels** for compute-bound prefill path (seq_len > 1).
+
+<Tabs>
+  <Tab title="Kernel">
+    ```metal
+    // dispatch: (ceil(M/32), ceil(N/32), 1) x (32, 1, 1)
+    // Tiled matrix multiply: C[M,N] = B[M,K] x A[K,N]
+    kernel void steel_gemm_f16_32x32x16(
+        device half*             C      [[buffer(0)]],
+        device const half*       A      [[buffer(1)]],
+        device const half*       B      [[buffer(2)]],
+        constant uint*           params [[buffer(4)]],
+        uint2 tgid [[threadgroup_position_in_grid]],
+        uint2 lid  [[thread_position_in_threadgroup]])
+    {
+        uint seq_len    = params[0];
+        uint act_stride = params[1];
+        uint K          = params[2];
+        uint M          = params[3];
+        
+        uint m = tgid.x * 32u + lid.x;
+        if (m >= M) return;
+        
+        uint n_start = tgid.y * 32u;
+        for (uint cn = 0u; cn < 32u; cn++) {
+            uint n = n_start + cn;
+            if (n >= seq_len) break;
+            
+            float sum = 0.0f;
+            for (uint kk = 0u; kk < K; kk++) {
+                sum += float(A[kk * act_stride + n]) * float(B[m * K + kk]);
+            }
+            C[m * act_stride + n] = half(sum);
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Variants">
+    | Variant | Tile | GPU Family | Precision |
+    |---------|------|------------|----------|
+    | `steel_gemm_f16_32x32x16` | 32×32×16 | Apple7 (M1/M2) | FP16 |
+    | `steel_gemm_f16_64x64x32` | 64×64×32 | Apple8+ (M3+) | FP16 |
+    | `steel_gemm_bf16_64x64x32` | 64×64×32 | Apple9+ (M4) | BF16 |
+  </Tab>
+  <Tab title="Performance">
+    **Characteristics:**
+    - **Compute-bound**: 65% utilization
+    - **Shared memory**: 2-8 KB for tile blocking
+    - **Arithmetic intensity**: High (tile reuse)
+    
+    **Layout:**
+    - `A`: Activation [K, act_stride] (column-major access)
+    - `B`: Weight [M, K] (row-major, contiguous)
+    - `C`: Output [M, act_stride]
+  </Tab>
+</Tabs>
+
+---
+
+### GEMV (General Matrix-Vector) — Decode
+
+**Shared-memory-free** GEMV for memory-bound decode path (seq_len = 1).
+
+<Tabs>
+  <Tab title="Kernel">
+    ```metal
+    // dispatch: (ceil(M/64), 1, 1) x (256, 1, 1)
+    // Each threadgroup processes 64 output rows (GEMV_BM)
+    // Each SIMD group handles 8 rows (GEMV_BR)
+    #define GEMV_BR    8u
+    #define GEMV_TG_SIZE 256u
+    #define GEMV_BM    64u  // 8 simdgroups × 8 rows
+    
+    kernel void gemv_f16(
+        device half*             C      [[buffer(0)]],
+        device const half*       A      [[buffer(1)]],
+        device const half*       B      [[buffer(2)]],
+        constant uint*           params [[buffer(4)]],
+        uint  tgid_x  [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        uint seq_len    = params[0];
+        uint act_stride = params[1];   // 1 for compact decode
+        uint K          = params[2];
+        uint M          = params[3];
+        
+        uint m_base = tgid_x * GEMV_BM + simd_gid * GEMV_BR;
+        
+        for (uint n = 0u; n < seq_len; n++) {
+            float acc[GEMV_BR] = {};
+            
+            // Vectorized half4 reads (4× fewer transactions)
+            uint k_vec = K / 4u;
+            for (uint kv = simd_lid; kv < k_vec; kv += 32u) {
+                uint base_k = kv * 4u;
+                half4 a = *(device const half4*)(A + base_k * act_stride + n);
+                float a0 = float(a[0]), a1 = float(a[1]);
+                float a2 = float(a[2]), a3 = float(a[3]);
+                
+                for (uint r = 0u; r < GEMV_BR; r++) {
+                    uint m = m_base + r;
+                    if (m < M) {
+                        half4 w = *(device const half4*)(B + m * K + base_k);
+                        acc[r] += float(w[0]) * a0 + float(w[1]) * a1
+                                + float(w[2]) * a2 + float(w[3]) * a3;
+                    }
+                }
+            }
+            
+            // Reduce within SIMD group and write output
+            for (uint r = 0u; r < GEMV_BR; r++) {
+                float total = simd_sum(acc[r]);
+                uint m = m_base + r;
+                if (simd_lid == 0u && m < M) {
+                    C[m * act_stride + n] = half(total);
+                }
+            }
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Design">
+    **Key optimizations:**
+    
+    1. **Shared-memory-free**: No threadgroup barriers
+       - Direct device memory reads
+       - Compact stride=1 → contiguous access
+       - Excellent L1/L2 cache hit rate
+    
+    2. **Vectorized loads**: `half4` (8 bytes per load)
+       - 4× fewer memory transactions
+       - Reduced register pressure
+    
+    3. **Simdgroup reduction**: Hardware `simd_sum`
+       - 32 threads → 1 value in ~5 cycles
+       - No explicit shuffle loops
+  </Tab>
+  <Tab title="Performance">
+    **Characteristics:**
+    - **Memory-bound**: 75% bandwidth utilization
+    - **Shared memory**: 0 bytes
+    - **Latency**: Weight streaming from DRAM
+    
+    **Throughput** (M1 Pro, 200 GB/s):
+    - FP16 GEMV (4096×4096): ~150 GB/s sustained
+    - Decode token time: 6-8ms (4B model)
+  </Tab>
+</Tabs>
+
+---
+
+### Quantized GEMV (Q4_0, Q8_0)
+
+**Fast quantized matrix-vector** using MLX QMV templates.
+
+<Tabs>
+  <Tab title="Q4_0">
+    ```metal
+    // Q4_0: 4-bit weights, group_size=32
+    // Buffer layout: [scale (fp16)] [qs (32×4bit packed)]
+    
+    kernel void unc_mlx_qmv_fast_q4_0(
+        device half*             y      [[buffer(0)]],
+        device const half*       x      [[buffer(1)]],
+        device const uint8_t*    w      [[buffer(2)]],  // Q4_0_FAST format
+        constant uint*           params [[buffer(4)]],
+        uint  tgid_x  [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        constexpr int group_size = 32;
+        constexpr int bits = 4;
+        
+        // Dequantize 32 weights per group
+        for (int g = 0; g < num_groups; g++) {
+            half scale = w[g * 34];  // First 2 bytes = scale
+            uint8_t* qs = &w[g * 34 + 2];
+            
+            // Unpack 4-bit values
+            for (int i = 0; i < 16; i++) {
+                float w0 = float((qs[i] & 0xF) - 8) * float(scale);
+                float w1 = float((qs[i] >> 4) - 8) * float(scale);
+                acc += w0 * x[g*32 + i*2] + w1 * x[g*32 + i*2 + 1];
+            }
+        }
+    }
+    ```
+    
+    **Performance**: 152 tok/s (TinyLlama 1.1B, M1 Pro)
+    - **Memory savings**: 4× vs FP16
+    - **Throughput**: 2× vs FP16 GEMV
+  </Tab>
+  <Tab title="Q8_0">
+    ```metal
+    // Q8_0: 8-bit weights, group_size=32
+    // Buffer layout: [scale (fp16)] [qs (32×int8)]
+    
+    kernel void quantized_gemv_q8_0(...) {
+        for (int g = 0; g < num_groups; g++) {
+            half scale = w[g * 34];
+            int8_t* qs = &w[g * 34 + 2];
+            
+            for (int i = 0; i < 32; i++) {
+                acc += float(qs[i]) * float(scale) * x[g*32 + i];
+            }
+        }
+    }
+    ```
+    
+    **Performance**: 76.6 tok/s (TinyLlama 1.1B, M1 Pro)
+    - **Memory savings**: 2× vs FP16
+    - **Quality**: Minimal degradation
+  </Tab>
+</Tabs>
+
+---
+
+## Attention Kernels
+
+### Scaled Dot-Product Attention (SDPA) — Decode
+
+**Vectorized single-token attention** using MLX `sdpa_vector` template.
+
+<Tabs>
+  <Tab title="Kernel">
+    ```metal
+    // dispatch: (num_q_heads, 1, 1) x (32, 32, 1)
+    // 32 simdgroups × 32 threads = 1024 threads per head
+    // Processes KV cache positions in parallel
+    
+    kernel void sdpa_vector_float16_t_64_64(
+        device half*             out        [[buffer(0)]],
+        device const half*       q          [[buffer(1)]],
+        device const half*       k_cache    [[buffer(2)]],
+        device const half*       v_cache    [[buffer(3)]],
+        constant uint*           params     [[buffer(4)]],
+        uint  tgid_x  [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        constexpr int BN = 32;      // simdgroups
+        constexpr int HEAD_DIM = 64;
+        
+        uint q_head_idx  = tgid_x;
+        uint kv_head_idx = q_head_idx / gqa_factor;
+        int  total_seq   = params[1];
+        float scale      = 1.0f / sqrt(float(HEAD_DIM));
+        
+        // Load Q for this head
+        float q[2];  // HEAD_DIM/32 = 2 elements per thread
+        for (int i = 0; i < 2; i++) {
+            q[i] = float(q_ptr[simd_lid * 2 + i]) * scale;
+        }
+        
+        // Attend over all cached positions
+        float o[2] = {};
+        float max_score = -FLT_MAX;
+        float sum_exp = 0.0f;
+        
+        for (int pos = simd_gid; pos < total_seq; pos += BN) {
+            // Load K for this position
+            float k[2];
+            for (int i = 0; i < 2; i++) {
+                k[i] = float(k_cache[pos * HEAD_DIM + simd_lid * 2 + i]);
+            }
+            
+            // Compute Q·K
+            float score = q[0]*k[0] + q[1]*k[1];
+            score = simd_sum(score);  // Reduce across simdgroup
+            
+            // Online softmax
+            float new_max = max(max_score, score);
+            float factor = exp(max_score - new_max);
+            float exp_score = exp(score - new_max);
+            max_score = new_max;
+            sum_exp = sum_exp * factor + exp_score;
+            
+            // Accumulate attention-weighted V
+            for (int i = 0; i < 2; i++) {
+                float v = float(v_cache[pos * HEAD_DIM + simd_lid * 2 + i]);
+                o[i] = o[i] * factor + exp_score * v;
+            }
+        }
+        
+        // Reduce across simdgroups and write output
+        // (inter-simdgroup reduction using threadgroup memory)
+        for (int i = 0; i < 2; i++) {
+            o[i] /= sum_exp;
+            out[q_head_idx * HEAD_DIM + simd_lid * 2 + i] = half(o[i]);
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Variants">
+    | Variant | Head Dim | Use Case |
+    |---------|----------|----------|
+    | `sdpa_vector_float16_t_64_64` | 64 | TinyLlama, Phi-2 |
+    | `sdpa_vector_float16_t_128_128` | 128 | Llama-2/3, Mistral, Qwen |
+    | `sdpa_vector_2pass_1_*` | 64/128 | Long context (2-pass) |
+    | `sdpa_vector_2pass_2_*` | 64/128 | Long context (reduction) |
+  </Tab>
+  <Tab title="Performance">
+    **Online softmax** eliminates materialization:
+    - No intermediate storage for scores
+    - Running max/sum updated incrementally
+    - Single pass over KV cache
+    
+    **GQA support**: Grouped Query Attention
+    - `kv_head_idx = q_head_idx / gqa_factor`
+    - Qwen3-4B: 32 Q heads, 8 KV heads (GQA=4)
+    
+    **Memory bandwidth**:
+    - Read: KV cache (seq_len × head_dim × 4 bytes)
+    - Write: Output (head_dim × 2 bytes)
+    - Bandwidth-bound for long sequences
+  </Tab>
+</Tabs>
+
+---
+
+### Flash Attention — Prefill
+
+**Steel attention kernels** for causal/non-causal prefill.
+
+<Note>
+Flash Attention fuses the entire attention computation:
+- QK^T matmul
+- Scaling + optional causal mask
+- Softmax (online, no materialization)
+- Softmax·V matmul
+
+Result: **3× memory savings** and **1.5× speedup** vs unfused.
+</Note>
+
+```metal
+// dispatch: (seq_len, num_heads, 1) x (32, 1, 1)
+kernel void steel_attention_causal_f16(
+    device half*             out    [[buffer(0)]],
+    device const half*       q      [[buffer(1)]],
+    device const half*       k      [[buffer(2)]],
+    device const half*       v      [[buffer(3)]],
+    constant AttentionParams* params [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_position_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    // Each threadgroup handles one (seq_pos, head) pair
+    uint seq_pos = tgid.x;
+    uint head_idx = tgid.y;
+    
+    // Tile Q, K, V into shared memory
+    // Compute attention scores with causal masking
+    // Apply online softmax
+    // Accumulate weighted V
+}
+```
+
+**Supported head dimensions**: 64, 80, 96, 128
+
+---
+
+## Normalization Kernels
+
+### RMSNorm
+
+**Root Mean Square normalization** with two-pass reduction.
+
+<Tabs>
+  <Tab title="Kernel">
+    ```metal
+    // dispatch: (seq_len, 1, 1) x (256, 1, 1)
+    kernel void rms_norm_f16(
+        device half*             out     [[buffer(0)]],
+        device const half*       x       [[buffer(1)]],
+        device const half*       weight  [[buffer(2)]],
+        constant uint*           params  [[buffer(4)]],
+        uint tgid_x [[threadgroup_position_in_grid]],
+        uint lid_x  [[thread_position_in_threadgroup]],
+        threadgroup float*       shared  [[threadgroup(0)]])
+    {
+        uint seq_len    = params[0];
+        uint act_stride = params[1];
+        uint h          = params[2];
+        float eps       = as_type<float>(params[3]);
+        
+        uint si = tgid_x;
+        if (si >= seq_len) return;
+        
+        // Phase 1: Parallel sum of squares
+        float partial_sq = 0.0f;
+        for (uint hi = lid_x; hi < h; hi += 256u) {
+            float v = float(x[hi * act_stride + si]);
+            partial_sq += v * v;
+        }
+        shared[lid_x] = partial_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        // Tree reduction
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (lid_x < stride) {
+                shared[lid_x] += shared[lid_x + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        
+        float scale = rsqrt(shared[0] / float(h) + eps);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        // Phase 2: Strided output write
+        for (uint hi = lid_x; hi < h; hi += 256u) {
+            float v = float(x[hi * act_stride + si]);
+            out[hi * act_stride + si] = half(v * scale * float(weight[hi]));
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="QKNorm">
+    **Per-head RMSNorm** for Q/K projections (Qwen3):
+    
+    ```metal
+    // dispatch: (seq_len * num_heads, 1, 1) x (128, 1, 1)
+    kernel void qk_norm_f16(...) {
+        uint si = tgid_x / num_heads;  // seq position
+        uint hi = tgid_x % num_heads;  // head index
+        
+        // Normalize within this head only
+        uint base = hi * head_dim;
+        for (uint d = lid_x; d < head_dim; d += 128u) {
+            // compute per-head RMS, scale
+        }
+    }
+    ```
+    
+    Used in Qwen3 for improved training stability.
+  </Tab>
+</Tabs>
+
+---
+
+## Positional Encoding
+
+### RoPE (Rotary Position Embedding)
+
+**Non-interleaved RoPE** with precomputed cos/sin table.
+
+<Tabs>
+  <Tab title="Kernel">
+    ```metal
+    // dispatch: (seq_len, 1, 1) x (256, 1, 1)
+    kernel void rope_f16(
+        device half*             out    [[buffer(0)]],
+        device const half*       x      [[buffer(1)]],
+        constant uint*           params [[buffer(4)]],
+        uint tgid_x [[threadgroup_position_in_grid]],
+        uint lid_x  [[thread_position_in_threadgroup]])
+    {
+        uint seq_len      = params[0];
+        uint act_stride   = params[1];
+        uint rope_dim     = params[2];   // num_heads * head_dim
+        uint head_dim     = params[3];
+        float base        = as_type<float>(params[5]);
+        uint total_seq    = params[6];
+        
+        uint si = tgid_x;
+        if (si >= seq_len) return;
+        
+        uint abs_pos = total_seq - seq_len + si;
+        uint half_dim = head_dim / 2u;
+        
+        // 256 threads split the rope_dim/2 pairs
+        uint n_pairs = rope_dim / 2u;
+        uint chunk   = (n_pairs + 255u) / 256u;
+        uint p_start = lid_x * chunk;
+        uint p_end   = min(p_start + chunk, n_pairs);
+        
+        for (uint pi = p_start; pi < p_end; pi++) {
+            uint head_idx = pi / half_dim;
+            uint pair_pos = pi % half_dim;
+            
+            uint hi0 = head_idx * head_dim + pair_pos;
+            uint hi1 = head_idx * head_dim + pair_pos + half_dim;
+            
+            // Compute rotation angle
+            float theta = (float)abs_pos / pow(base, 2.0f * (float)pair_pos / (float)head_dim);
+            float cos_t = cos(theta);
+            float sin_t = sin(theta);
+            
+            // Apply 2D rotation
+            float x0 = float(x[hi0 * act_stride + si]);
+            float x1 = float(x[hi1 * act_stride + si]);
+            
+            out[hi0 * act_stride + si] = half(x0 * cos_t - x1 * sin_t);
+            out[hi1 * act_stride + si] = half(x0 * sin_t + x1 * cos_t);
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Fused RoPE+KV">
+    **Fused RoPE Q+K + KV Cache Write**:
+    
+    ```metal
+    kernel void rope_qk_kv_append_f16(
+        device half*             out_q   [[buffer(0)]],
+        device const half*       q_in    [[buffer(1)]],
+        device half*             k_cache [[buffer(2)]],
+        device const half*       k_in    [[buffer(3)]],
+        device half*             v_cache [[buffer(4)]],
+        device const half*       v_in    [[buffer(5)]],
+        constant uint*           params  [[buffer(6)]],
+        device const half*       rope_table [[buffer(7)]],
+        ...)
+    {
+        // Apply RoPE to Q, write to activation buffer
+        // Apply RoPE to K, write directly to KV cache
+        // Copy V directly to KV cache
+        // Saves 1 dispatch per layer vs separate ops
+    }
+    ```
+    
+    **Performance gain**: 10-15% per layer (eliminates 2 dispatches)
+  </Tab>
+</Tabs>
+
+---
+
+## Memory Kernels
+
+### Gather (Embedding Lookup)
+
+```metal
+// dispatch: (seq_len, 1, 1) x (256, 1, 1)
+kernel void gather_f16(
+    device half*             out        [[buffer(0)]],
+    device const half*       embed      [[buffer(1)]],
+    device const uint*       token_ids  [[buffer(2)]],
+    constant uint*           params     [[buffer(4)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint lid_x  [[thread_position_in_threadgroup]])
+{
+    uint seq_len   = params[0];
+    uint act_stride = params[1];
+    uint h          = params[2];  // hidden size
+    
+    uint si = tgid_x;
+    if (si >= seq_len) return;
+    
+    uint token = token_ids[si];
+    
+    // 256 threads split hidden dimension
+    uint chunk = (h + 255u) / 256u;
+    uint hi_start = lid_x * chunk;
+    uint hi_end   = min(hi_start + chunk, h);
+    
+    for (uint hi = hi_start; hi < hi_end; hi++) {
+        out[hi * act_stride + si] = embed[token * h + hi];
+    }
+}
+```
+
+### KV Cache Append
+
+```metal
+// dispatch: (seq_len, 1, 1) x (256, 1, 1)
+kernel void kv_cache_append_fused_f16(
+    device half*             k_cache [[buffer(0)]],
+    device const half*       new_k   [[buffer(1)]],
+    device half*             v_cache [[buffer(2)]],
+    device const half*       new_v   [[buffer(3)]],
+    constant uint*           params  [[buffer(4)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint lid_x  [[thread_position_in_threadgroup]])
+{
+    uint seq_len    = params[0];
+    uint total_seq  = params[1];
+    uint act_stride = params[2];
+    uint head_dim   = params[3];
+    uint max_seq    = params[4];
+    uint kv_dim     = params[5];  // num_kv_heads * head_dim
+    
+    uint kv_pos_start = total_seq - seq_len;
+    uint si = tgid_x;
+    if (si >= seq_len) return;
+    
+    uint global_pos = kv_pos_start + si;
+    
+    // Fused K+V append
+    for (uint e = lid_x; e < kv_dim; e += 256u) {
+        uint kv_head = e / head_dim;
+        uint d       = e % head_dim;
+        
+        half k_val = new_k[e * act_stride + si];
+        k_cache[kv_head * max_seq * head_dim + global_pos * head_dim + d] = k_val;
+        
+        half v_val = new_v[e * act_stride + si];
+        v_cache[kv_head * max_seq * head_dim + global_pos * head_dim + d] = v_val;
+    }
+}
+```
+
+### Softmax
+
+**Three-pass row-wise softmax**:
+
+```metal
+// dispatch: (seq_len, 1, 1) x (256, 1, 1)
+kernel void softmax_f16(...) {
+    // Pass 1: Parallel max reduction
+    float local_max = -INFINITY;
+    for (uint i = lid_x; i < row_width; i += 256u) {
+        local_max = max(local_max, float(x[i * act_stride + si]));
+    }
+    // Tree reduce to shared[0]
+    
+    // Pass 2: Parallel exp-sum reduction
+    float local_sum = 0.0f;
+    for (uint i = lid_x; i < row_width; i += 256u) {
+        local_sum += exp(float(x[i * act_stride + si]) - mx);
+    }
+    // Tree reduce to shared[0]
+    
+    // Pass 3: Parallel normalize
+    float inv_sum = 1.0f / total;
+    for (uint i = lid_x; i < row_width; i += 256u) {
+        out[i * act_stride + si] = half(exp(float(x[i * act_stride + si]) - mx) * inv_sum);
+    }
+}
+```
+
+---
+
+## Activation Functions
+
+### SiLU (Swish)
+
+```metal
+kernel void silu_f16(
+    device half*             out [[buffer(0)]],
+    device const half*       x   [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    float v = float(x[gid]);
+    out[gid] = half(v / (1.0f + exp(-v)));
+}
+```
+
+### GELU
+
+```metal
+kernel void gelu_f16(
+    device half*             out [[buffer(0)]],
+    device const half*       x   [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    float v = float(x[gid]);
+    out[gid] = half(0.5f * v * (1.0f + erf(v / sqrt(2.0f))));
+}
+```
+
+---
+
+## Utility Kernels
+
+### BF16 → FP16 Conversion
+
+**Used at weight loading time** for Apple9+ models:
+
+```metal
+// dispatch: (ceil(count/256), 1, 1) x (256, 1, 1)
+kernel void bf16_to_f16(
+    device uint16_t* data [[buffer(0)]],
+    constant uint& count  [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    uint16_t b = data[gid];
+    uint16_t sign = (b >> 15) & 1;
+    int exp8 = (b >> 7) & 0xFF;
+    uint16_t mant7 = b & 0x7F;
+    
+    uint16_t f16;
+    if (exp8 == 0) {
+        f16 = sign << 15;  // Zero
+    } else if (exp8 == 0xFF) {
+        f16 = (sign << 15) | (0x1F << 10) | (mant7 << 3);  // Inf/NaN
+    } else {
+        int u = exp8 - 127;
+        if (u > 15) f16 = (sign << 15) | (0x1F << 10);  // Overflow
+        else if (u < -14) f16 = sign << 15;  // Underflow
+        else f16 = (sign << 15) | ((u + 15) << 10) | (mant7 << 3);
+    }
+    data[gid] = f16;
+}
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Fusion Patterns" icon="layer-group" href="/metal/fusion-patterns">
+    Learn about multi-op kernel fusion
+  </Card>
+  <Card title="Metal Overview" icon="chip" href="/metal/overview">
+    Return to Metal backend architecture
+  </Card>
+</CardGroup>

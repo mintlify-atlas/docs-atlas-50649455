@@ -1,0 +1,243 @@
+---
+title: Installation
+description: Install UNC and set up your development environment for compiling neural networks on Apple Silicon
+---
+
+# Installation
+
+This guide will walk you through installing UNC and its dependencies on macOS with Apple Silicon.
+
+<Warning>
+UNC currently requires macOS with Apple Silicon (M1/M2/M3/M4) for Metal backend support. CUDA, ROCm, and WASM backends are planned but not yet available.
+</Warning>
+
+## Prerequisites
+
+Before installing UNC, you'll need to set up the following dependencies:
+
+<Steps>
+  <Step title="Install Rust Toolchain">
+    UNC is written in Rust and requires the Rust toolchain to build from source.
+
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+
+    Follow the on-screen instructions. When prompted, choose the default installation option.
+
+    After installation, restart your terminal or run:
+
+    ```bash
+    source $HOME/.cargo/env
+    ```
+
+    Verify the installation:
+
+    ```bash
+    rustc --version
+    cargo --version
+    ```
+
+    <Note>
+    UNC requires Rust edition 2021 or later. The installer will provide a compatible version.
+    </Note>
+  </Step>
+
+  <Step title="Install Xcode Command Line Tools">
+    The Xcode Command Line Tools are required for the Metal compiler and C/C++ toolchain.
+
+    ```bash
+    xcode-select --install
+    ```
+
+    A dialog will appear asking you to install the tools. Click "Install" and wait for the installation to complete.
+
+    Verify the installation:
+
+    ```bash
+    xcode-select -p
+    ```
+
+    This should output something like `/Library/Developer/CommandLineTools`.
+
+    <Note>
+    If you have Xcode installed, the full Xcode installation also includes the Command Line Tools.
+    </Note>
+  </Step>
+</Steps>
+
+## Building UNC
+
+Once the prerequisites are installed, you can build UNC from source.
+
+<Steps>
+  <Step title="Clone the Repository">
+    Clone the UNC repository to your local machine:
+
+    ```bash
+    git clone <repo-url>
+    cd unc
+    ```
+
+    <Note>
+    Replace `<repo-url>` with the actual repository URL when available.
+    </Note>
+  </Step>
+
+  <Step title="Build the Release Binary">
+    Build UNC in release mode for optimal performance:
+
+    ```bash
+    cargo build --release
+    ```
+
+    This will compile UNC and all its dependencies. The first build may take several minutes.
+
+    <Note>
+    The compiled binary will be located at `target/release/unc`
+    </Note>
+  </Step>
+
+  <Step title="Add UNC to Your PATH (Optional)">
+    For easier access, add the UNC binary to your PATH:
+
+    ```bash
+    export PATH="$PATH:$(pwd)/target/release"
+    ```
+
+    To make this permanent, add the line above to your shell configuration file (`~/.zshrc` or `~/.bash_profile`).
+
+    Alternatively, you can install UNC globally using cargo:
+
+    ```bash
+    cargo install --path .
+    ```
+  </Step>
+
+  <Step title="Verify Installation">
+    Verify that UNC is installed correctly:
+
+    ```bash
+    unc --version
+    ```
+
+    You should see output similar to:
+
+    ```
+    unc 0.1.0
+    ```
+
+    List available commands:
+
+    ```bash
+    unc --help
+    ```
+  </Step>
+</Steps>
+
+## Configuration
+
+### HuggingFace Token (Optional)
+
+Some models on HuggingFace require authentication. If you need to access gated models:
+
+<Steps>
+  <Step title="Create a HuggingFace Account">
+    Sign up at [huggingface.co](https://huggingface.co) if you don't already have an account.
+  </Step>
+
+  <Step title="Generate an Access Token">
+    1. Go to your [HuggingFace settings](https://huggingface.co/settings/tokens)
+    2. Click "New token"
+    3. Give it a name and select "Read" permissions
+    4. Copy the generated token
+  </Step>
+
+  <Step title="Set the Environment Variable">
+    You can provide the token in two ways:
+
+    **Option 1: Environment variable (recommended)**
+
+    ```bash
+    export HF_TOKEN="your_token_here"
+    ```
+
+    Add this to your `~/.zshrc` or `~/.bash_profile` to make it permanent.
+
+    **Option 2: Command-line flag**
+
+    ```bash
+    unc compile --model <model-name> --hf-token "your_token_here"
+    ```
+  </Step>
+</Steps>
+
+### Cache Directory
+
+UNC uses the standard HuggingFace cache directory to store downloaded models:
+
+```bash
+~/.cache/huggingface
+```
+
+<Note>
+Model files are cached locally after the first download, so subsequent compilations of the same model will be faster.
+</Note>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Metal.framework not found">
+    This error indicates that the Xcode Command Line Tools are not properly installed.
+
+    **Solution:**
+    ```bash
+    xcode-select --install
+    ```
+
+    If the tools are already installed, try resetting the path:
+    ```bash
+    sudo xcode-select --reset
+    ```
+  </Accordion>
+
+  <Accordion title="Rust compiler errors">
+    If you encounter Rust compiler errors, ensure you have the latest stable Rust version:
+
+    ```bash
+    rustup update stable
+    ```
+  </Accordion>
+
+  <Accordion title="Build takes too long">
+    The first build can take 5-10 minutes depending on your system. To speed up subsequent builds:
+
+    - Use `cargo build --release` only for final builds
+    - Use `cargo build` (without `--release`) for faster development builds
+    - Consider using `cargo install sccache` for distributed compilation caching
+  </Accordion>
+
+  <Accordion title="Permission denied errors">
+    If you encounter permission errors when running `cargo install`:
+
+    ```bash
+    cargo install --path . --locked
+    ```
+
+    Or ensure your `~/.cargo/bin` directory has proper permissions:
+    ```bash
+    chmod -R u+w ~/.cargo
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## What's Next?
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Compile your first model and run inference
+  </Card>
+  <Card title="Supported Architectures" icon="list" href="#">
+    View the list of supported model architectures
+  </Card>
+</CardGroup>

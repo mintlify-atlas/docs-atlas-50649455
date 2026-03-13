@@ -1,80 +1,222 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Compile and run your first model with UNC in minutes"
 ---
 
-## Get started in three steps
+Get started with UNC by compiling TinyLlama and running your first inference.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, make sure you have:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- macOS with Apple Silicon (M1, M2, M3, or M4)
+- UNC installed (see [Installation](/installation))
+- At least 8GB of available disk space
 
-### Step 2: Deploy your changes
+## Compile Your First Model
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Steps>
+  <Step title="Compile TinyLlama with Q4_0 quantization">
+    Start with a small model that compiles quickly:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```bash
+    unc compile \
+      --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+      --quant q4-0 \
+      -o ./tinyllama
+    ```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    This will:
+    - Download the model from HuggingFace (auto-cached)
+    - Parse the model architecture (config.json)
+    - Build the computation graph
+    - Apply optimization passes (QKV fusion, memory planning, etc.)
+    - Generate Metal kernels
+    - Produce `tinyllama.unc` bundle
 
-### Step 3: Go live
+    **Expected output:**
+    ```
+    unc: compiling TinyLlama/TinyLlama-1.1B-Chat-v1.0 → ./tinyllama.unc
+      arch=LLaMA, layers=22, heads=32 (kv=4), hidden=2048, ffn=5632
+      graph: 156 nodes, quant: q4_0
+      registry: 47 kernels for metal_m1
+      compile: 89 nodes, 23 kernels, activation=128 MB, kv=512 MB
+    Done → ./tinyllama.unc
+    ```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    <Note>
+      First compilation may take 2-5 minutes. Subsequent compilations are faster due to HuggingFace caching.
+    </Note>
+  </Step>
 
-## Next steps
+  <Step title="Run inference">
+    Run the compiled model:
 
-Now that you have your docs running, explore these key features:
+    ```bash
+    unc run ./tinyllama.unc --prompt "The history of" --max-tokens 200
+    ```
 
-<CardGroup cols={2}>
+    You should see output like:
+    ```
+    The history of the United States is a complex and fascinating story...
+    [152.0 tok/s, 200 tokens in 1.32s]
+    ```
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+    <Tip>
+      On M1 Pro with Q4_0 quantization, expect around 150 tok/s for TinyLlama.
+    </Tip>
+  </Step>
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+  <Step title="Try different prompts">
+    Experiment with different inputs:
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+    ```bash
+    # Creative writing
+    unc run ./tinyllama.unc --prompt "Once upon a time" --max-tokens 100
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+    # Technical explanation
+    unc run ./tinyllama.unc --prompt "Explain quantum computing:" --max-tokens 150
 
-</CardGroup>
+    # Multi-line prompt
+    unc run ./tinyllama.unc --prompt "Question: What is machine learning?
+    Answer:" --max-tokens 100
+    ```
+  </Step>
+</Steps>
+
+## Compare Quantization Options
+
+Try different quantization levels to see the speed vs quality tradeoff:
+
+<CodeGroup>
+
+```bash Q4_0 (Fastest)
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama-q4
+# Size: 600 MB, Speed: ~152 tok/s
+```
+
+```bash Q8_0 (Balanced)
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q8-0 -o ./tinyllama-q8
+# Size: 1.1 GB, Speed: ~76 tok/s
+```
+
+```bash F16 (Best Quality)
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant f16 -o ./tinyllama-f16
+# Size: 2.2 GB, Speed: ~48 tok/s
+```
+
+</CodeGroup>
+
+| Quantization | Size | Speed | Quality | Use Case |
+|--------------|------|-------|---------|----------|
+| **Q4_0** | 600 MB | 152 tok/s | Good | Production, fast inference |
+| **Q8_0** | 1.1 GB | 76 tok/s | Better | Quality-sensitive apps |
+| **F16** | 2.2 GB | 48 tok/s | Best | Benchmarking, reference |
+
+## Try Larger Models
+
+Once comfortable with TinyLlama, try larger models:
+
+<Tabs>
+  <Tab title="Qwen3-4B">
+    ```bash
+    unc compile --model Qwen/Qwen3-4B --quant q4-0 -o ./qwen3
+    unc run ./qwen3.unc --prompt "Write a haiku about compilers:" --max-tokens 50
+    ```
+    Expected performance: ~39 tok/s on M1 Pro
+  </Tab>
+
+  <Tab title="Phi-3-Mini">
+    ```bash
+    unc compile --model microsoft/Phi-3-mini-4k-instruct --quant q4-0 -o ./phi3
+    unc run ./phi3.unc --prompt "Explain tensors:" --max-tokens 100
+    ```
+  </Tab>
+
+  <Tab title="Mistral-7B">
+    ```bash
+    unc compile --model mistralai/Mistral-7B-v0.1 --quant q4-0 -o ./mistral
+    unc run ./mistral.unc --prompt "The future of AI is" --max-tokens 150
+    ```
+    Requires 16GB+ RAM for compilation
+  </Tab>
+</Tabs>
+
+## Create a Standalone Binary
+
+For deployment, compile to a standalone binary with embedded weights:
+
+```bash
+unc compile \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --quant q4-0 \
+  --binary \
+  -o ./tinyllama-standalone
+
+# Run the binary directly
+./tinyllama-standalone "The meaning of life is" --max-tokens 100
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  AOT binaries are self-contained (600MB-2GB) but start instantly (less than 100ms) and have zero dependencies.
 </Note>
+
+## Inspect Compiled Models
+
+View details about a compiled model:
+
+```bash
+# Basic info
+unc inspect ./tinyllama.unc
+
+# With IR dump
+unc inspect ./tinyllama.unc --dump-ir
+```
+
+**Example output:**
+```
+=== ./tinyllama.unc ===
+model:  TinyLlama/TinyLlama-1.1B-Chat-v1.0
+arch:   LLaMA
+target: METAL
+nodes:  89
+stats:  nodes_after=89 unique_kernels=23 fusions_applied=18
+```
+
+## Common Issues
+
+<AccordionGroup>
+  <Accordion title="Model download is slow">
+    HuggingFace downloads can take time on first run. Models are cached in `~/.cache/huggingface/hub/` for future use.
+  </Accordion>
+
+  <Accordion title="Out of memory during compilation">
+    Try:
+    - Closing other apps
+    - Using a smaller model first
+    - Reducing `--max-seq-len` (default: 4096)
+  </Accordion>
+
+  <Accordion title="Slower than expected">
+    - First run includes JIT compilation overhead (~1s)
+    - Performance degrades when GPU is hot (thermal throttling)
+    - Check Activity Monitor for competing GPU workloads
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="CLI Reference" icon="terminal" href="/cli/compile">
+    Explore all compilation options and flags
+  </Card>
+  <Card title="Supported Models" icon="robot" href="/guides/supported-models">
+    See all supported architectures and models
+  </Card>
+  <Card title="Performance Tuning" icon="gauge-high" href="/guides/performance-tuning">
+    Optimize for maximum throughput
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Understand how UNC works under the hood
+  </Card>
+</CardGroup>

@@ -1,0 +1,158 @@
+---
+title: "unc inspect"
+description: "Inspect a .unc file (dump IR, memory plan, kernel list)"
+---
+
+The `inspect` command displays detailed information about a compiled `.unc` model bundle, including metadata, statistics, and optionally the intermediate representation (IR).
+
+## Usage
+
+```bash
+unc inspect <UNC_FILE> [OPTIONS]
+```
+
+## Parameters
+
+<ParamField path="unc_file" type="path" required>
+  Path to the compiled `.unc` model file to inspect.
+</ParamField>
+
+<ParamField path="--dump-ir" type="boolean">
+  Include the full intermediate representation (IR) graph in the output.
+</ParamField>
+
+<ParamField path="--verbose" type="boolean">
+  Enable verbose debug logging (global flag).
+</ParamField>
+
+## Examples
+
+### Basic inspection
+
+View model metadata and statistics:
+
+```bash
+unc inspect llama2-7b.unc
+```
+
+Output:
+```
+=== llama2-7b.unc ===
+model:  meta-llama/Llama-2-7b-chat-hf
+arch:   LLaMA
+target: METAL
+nodes:  1847
+stats:  CompileStats { nodes_before: 1847, nodes_after: 1847, unique_kernels: 8, passes_run: 12 }
+```
+
+### Inspect with IR dump
+
+View the full computation graph:
+
+```bash
+unc inspect llama2-7b.unc --dump-ir
+```
+
+Output:
+```
+=== llama2-7b.unc ===
+model:  meta-llama/Llama-2-7b-chat-hf
+arch:   LLaMA
+target: METAL
+nodes:  1847
+stats:  CompileStats { nodes_before: 1847, nodes_after: 1847, unique_kernels: 8, passes_run: 12 }
+
+Graph {
+  node_0: Placeholder(shape=[1, seq], dtype=i32, name="input_ids")
+  node_1: Constant(shape=[32000, 4096], dtype=f16, name="embed_tokens.weight")
+  node_2: Gather(indices=node_0, params=node_1, axis=0)
+  node_3: Constant(shape=[4096], dtype=f16, name="layer.0.input_layernorm.weight")
+  node_4: RMSNorm(input=node_2, weight=node_3, eps=1e-5)
+  ...
+}
+```
+
+### Inspect multiple models
+
+Compare different model compilations:
+
+```bash
+unc inspect llama2-7b-f16.unc
+unc inspect llama2-7b-q4.unc
+```
+
+### Verbose inspection
+
+Enable debug logging during inspection:
+
+```bash
+unc inspect mistral-7b.unc --verbose
+```
+
+## Output Fields
+
+### Metadata
+
+- **model**: Original HuggingFace model identifier
+- **arch**: Model architecture family (LLaMA, Mistral, Qwen, Phi, Gemma)
+- **target**: Compilation target (METAL)
+- **nodes**: Number of computation graph nodes
+
+### Statistics
+
+- **nodes_before**: Graph nodes before optimization
+- **nodes_after**: Graph nodes after optimization passes
+- **unique_kernels**: Number of distinct Metal kernels used
+- **passes_run**: Number of compiler optimization passes applied
+
+### IR Dump (with --dump-ir)
+
+The IR dump shows the complete computation graph including:
+
+- Node operations (Placeholder, Constant, Gather, RMSNorm, MatMul, etc.)
+- Tensor shapes and data types
+- Weight names and parameters
+- Operation-specific attributes (epsilon, axes, etc.)
+
+## Use Cases
+
+### Verify compilation
+
+Check that a model compiled successfully:
+
+```bash
+unc inspect my-model.unc
+```
+
+### Debug performance
+
+Analyze kernel count and graph complexity:
+
+```bash
+unc inspect slow-model.unc
+```
+
+### Compare quantization
+
+See how quantization affects the graph:
+
+```bash
+unc inspect model-f16.unc --dump-ir > f16.txt
+unc inspect model-q4.unc --dump-ir > q4.txt
+diff f16.txt q4.txt
+```
+
+### Understand architecture
+
+Learn how a model is structured:
+
+```bash
+unc inspect gemma-2b.unc --dump-ir | less
+```
+
+## Notes
+
+- The `.unc` file must be a valid bundle created by `unc compile`
+- IR dumps can be very large for big models (thousands of lines)
+- Use shell redirection or `less` to handle large IR outputs
+- Node counts reflect the optimized graph after compiler passes

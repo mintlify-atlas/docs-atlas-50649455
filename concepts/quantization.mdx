@@ -1,0 +1,370 @@
+---
+title: 'Quantization Formats'
+description: 'Understanding F16, Q8_0, and Q4_0 quantization with performance tradeoffs'
+---
+
+## Overview
+
+UNC supports multiple weight quantization formats that trade model size and memory bandwidth for computational precision. All formats use the same IR and kernel infrastructure — quantization is applied during weight loading and kernel dispatch.
+
+| Format | Precision | Size (1.1B model) | Speed (tok/s) | Use Case |
+|--------|-----------|-------------------|---------------|----------|
+| **F16** | 16-bit float | 2.2 GB | 47.9 | Maximum quality, research |
+| **Q8_0** | 8-bit symmetric | 1.1 GB | 76.6 | Balanced quality/speed |
+| **Q4_0** | 4-bit symmetric | 0.6 GB | 152.0 | Production deployment |
+
+<Note>
+Performance numbers measured on Apple M1 Pro with TinyLlama 1.1B. Your results will vary based on model size, architecture, and hardware.
+</Note>
+
+## Data Type Definitions
+
+The type system is defined in `src/ir/types.rs:152-204`:
+
+```rust
+pub enum DType {
+    F32,      // 32-bit float (activation accumulation only)
+    F16,      // 16-bit float
+    BF16,     // 16-bit bfloat (brain float)
+    
+    // Block-quantized formats
+    Q8_0,     // 8-bit: 32 elements per block, 1 × f16 scale
+    Q4_0,     // 4-bit: 32 elements per block, 1 × f16 scale (symmetric)
+    Q4_1,     // 4-bit: 32 elements per block, f16 scale + f16 min
+    
+    // Integer types
+    I32, U32, Bool,
+}
+```
+
+All quantized formats use **block-structured encoding**: weights are divided into blocks of 32 elements, each with its own scaling factors.
+
+## F16: 16-bit Floating Point
+
+### Format
+
+Standard IEEE 754 half-precision floating point:
+- **1 bit**: Sign
+- **5 bits**: Exponent
+- **10 bits**: Mantissa
+- **Range**: ±65504, precision ~3-4 decimal digits
+
+### Storage
+
+```c
+// Direct storage, 2 bytes per element
+half weights[hidden_dim * intermediate_size];  // No compression
+```
+
+### Compute
+
+Metal kernels use native `half` type:
+
+```metal
+kernel void matmul_f16(
+    device const half* weight [[buffer(0)]],
+    device const half* input [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    // ...
+) {
+    half sum = 0.0h;
+    for (uint i = 0; i < K; i++) {
+        sum += weight[row * K + i] * input[i];
+    }
+    output[row] = sum;
+}
+```
+
+### Characteristics
+
+**Advantages**:
+- No quantization error
+- Simple kernel implementation
+- Supported natively by Metal/GPU hardware
+- Numerically stable for training and fine-tuning
+
+**Disadvantages**:
+- Large memory footprint (2 bytes/element)
+- Memory bandwidth bound (not compute bound)
+- Slower than quantized formats on memory-limited systems
+
+**When to Use**:
+- Research and experimentation
+- When accuracy is critical and you have sufficient RAM
+- Baseline for comparing quantized formats
+- Models < 1B parameters on devices with 16GB+ unified memory
+
+## Q8_0: 8-bit Symmetric Quantization
+
+### Format
+
+Block-structured quantization with 32 elements per block:
+
+```c
+struct Q8_0_Block {
+    half scale;        // 2 bytes: scaling factor
+    int8_t data[32];   // 32 bytes: quantized values in [-127, 127]
+};  // Total: 34 bytes per 32 elements
+```
+
+**Size per block**: 34 bytes  
+**Effective bits per element**: 8.5 bits (34 bytes / 32 elements × 8)
+
+### Quantization Algorithm
+
+```python
+def quantize_q8_0(weights: np.ndarray) -> Q8_0_Block:
+    # Process in blocks of 32
+    blocks = weights.reshape(-1, 32)
+    
+    for block in blocks:
+        # Compute scale factor (symmetric: zero-point = 0)
+        scale = np.max(np.abs(block)) / 127.0
+        
+        # Quantize to [-127, 127]
+        quantized = np.round(block / scale).astype(np.int8)
+        quantized = np.clip(quantized, -127, 127)
+        
+        yield Q8_0_Block(scale=scale, data=quantized)
+```
+
+<Note>
+Q8_0 uses **symmetric quantization** (zero-point at 0), which simplifies dequantization but may waste range for asymmetric distributions. For weights centered near zero (common in transformers), this is efficient.
+</Note>
+
+### Dequantization Kernel
+
+Metal implementation (`kernel_sources/metal/unc_kernels/unc_kernels.metal`):
+
+```metal
+kernel void matvec_q8_0(
+    device const Q8_0_Block* weight [[buffer(0)]],
+    device const half* input [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    uint row [[thread_position_in_grid]]
+) {
+    float sum = 0.0f;
+    uint num_blocks = K / 32;
+    
+    for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
+        Q8_0_Block blk = weight[row * num_blocks + block_idx];
+        float scale = float(blk.scale);
+        
+        // Accumulate 32 elements
+        for (uint i = 0; i < 32; i++) {
+            float w = float(blk.data[i]) * scale;  // Dequantize
+            float x = float(input[block_idx * 32 + i]);
+            sum += w * x;
+        }
+    }
+    
+    output[row] = half(sum);
+}
+```
+
+### Characteristics
+
+**Advantages**:
+- **2x smaller** than F16 (1.1 GB vs 2.2 GB for 1.1B model)
+- **1.6x faster** than F16 (76.6 vs 47.9 tok/s on M1 Pro)
+- Minimal quality degradation (typically less than 1% perplexity increase)
+- Good balance between size and accuracy
+
+**Disadvantages**:
+- Slower than Q4_0 (76.6 vs 152.0 tok/s)
+- More memory bandwidth than Q4_0
+- Still requires 1GB+ for billion-parameter models
+
+**When to Use**:
+- Quality-sensitive applications where Q4_0 degrades too much
+- Models where 4-bit quantization shows noticeable artifacts
+- Devices with limited memory but strong GPU (8-16GB unified memory)
+
+## Q4_0: 4-bit Symmetric Quantization
+
+### Format
+
+Block-structured quantization with 32 elements per block:
+
+```c
+struct Q4_0_Block {
+    half scale;          // 2 bytes: scaling factor
+    uint8_t data[16];    // 16 bytes: 32 values packed as 4-bit
+};  // Total: 18 bytes per 32 elements
+```
+
+**Size per block**: 18 bytes  
+**Effective bits per element**: 4.5 bits (18 bytes / 32 elements × 8)
+
+Each `uint8_t` holds two 4-bit values:
+```c
+uint8_t packed = (value_lo & 0xF) | ((value_hi & 0xF) << 4);
+```
+
+### Quantization Algorithm
+
+```python
+def quantize_q4_0(weights: np.ndarray) -> Q4_0_Block:
+    blocks = weights.reshape(-1, 32)
+    
+    for block in blocks:
+        # Compute scale for 4-bit range [-8, 7]
+        scale = np.max(np.abs(block)) / 7.0
+        
+        # Quantize to [-8, 7]
+        quantized = np.round(block / scale).astype(np.int8)
+        quantized = np.clip(quantized, -8, 7)
+        
+        # Pack pairs into 4 bits each
+        packed = np.zeros(16, dtype=np.uint8)
+        for i in range(16):
+            lo = quantized[2*i] & 0xF
+            hi = quantized[2*i + 1] & 0xF
+            packed[i] = lo | (hi << 4)
+        
+        yield Q4_0_Block(scale=scale, data=packed)
+```
+
+### Dequantization Kernel
+
+```metal
+kernel void matvec_q4_0(
+    device const Q4_0_Block* weight [[buffer(0)]],
+    device const half* input [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    uint row [[thread_position_in_grid]]
+) {
+    float sum = 0.0f;
+    uint num_blocks = K / 32;
+    
+    for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
+        Q4_0_Block blk = weight[row * num_blocks + block_idx];
+        float scale = float(blk.scale);
+        
+        // Unpack and accumulate 32 elements
+        for (uint i = 0; i < 16; i++) {
+            uint8_t packed = blk.data[i];
+            
+            // Extract 4-bit values (stored as signed -8..7)
+            int8_t lo = (int8_t)(packed & 0xF);
+            int8_t hi = (int8_t)(packed >> 4);
+            if (lo > 7) lo -= 16;  // Sign extension
+            if (hi > 7) hi -= 16;
+            
+            float w0 = float(lo) * scale;
+            float w1 = float(hi) * scale;
+            
+            sum += w0 * float(input[block_idx * 32 + 2*i]);
+            sum += w1 * float(input[block_idx * 32 + 2*i + 1]);
+        }
+    }
+    
+    output[row] = half(sum);
+}
+```
+
+### Characteristics
+
+**Advantages**:
+- **3.7x smaller** than F16 (0.6 GB vs 2.2 GB)
+- **3.2x faster** than F16, **2x faster** than Q8_0 (152 tok/s on M1 Pro)
+- Enables larger models to fit in limited memory
+- Production-ready for most LLM applications
+
+**Disadvantages**:
+- ~2-5% perplexity degradation vs F16 (model-dependent)
+- Can show quantization artifacts on small models (less than 1B)
+- Requires careful validation for quality-critical applications
+
+**When to Use**:
+- Production deployment of LLMs
+- Memory-constrained devices (8GB MacBooks, iPads)
+- Maximum throughput is priority
+- Models >3B parameters (where memory dominates)
+
+<Warning>
+Q4_0 quantization is **not reversible** and introduces permanent precision loss. Always validate output quality on your specific use case before deploying. Some models (especially small ones less than 1B) may show degradation in reasoning or factual tasks.
+</Warning>
+
+## Performance Analysis
+
+### Throughput Breakdown (TinyLlama 1.1B on M1 Pro)
+
+| Format | Tok/s | Speedup | Memory BW (GB/s) | Compute Efficiency |
+|--------|-------|---------|------------------|-------------------|
+| F16 | 47.9 | 1.0× | 189 | 25% ALU utilization |
+| Q8_0 | 76.6 | 1.6× | 118 | 40% ALU utilization |
+| Q4_0 | 152.0 | 3.2× | 59 | 78% ALU utilization |
+
+**Key Insight**: Lower-bit quantization shifts the bottleneck from memory bandwidth to compute, better utilizing the GPU's arithmetic units.
+
+### Energy Efficiency (Q4_0 measured via macmon)
+
+```
+GPU Power:     11.3W (vs 14.1W for mlx-lm)
+Energy/Token:  74 mJ (vs 125 mJ for mlx-lm)  — 1.7x better
+Tokens/Wh:     12,800 (vs 8,000 for mlx-lm)
+```
+
+**Why Q4_0 is more efficient**:
+1. **Less DRAM traffic**: 4.5 bits/weight vs 16 bits
+2. **Better cache utilization**: More weights fit in L2/L3
+3. **Higher ALU usage**: Compute-bound vs memory-bound
+
+## Choosing a Quantization Level
+
+<Accordion title="Decision Tree">
+**Start with Q4_0** for most use cases:
+- Fast compilation for iteration
+- Good enough quality for 90% of applications
+- Maximum throughput
+
+**Upgrade to Q8_0** if:
+- Quality metrics show >3% degradation
+- Handling safety-critical or medical applications
+- Model is less than 1B parameters and shows artifacts
+
+**Use F16** only if:
+- You're fine-tuning or training
+- Strict accuracy requirements (e.g., benchmarking)
+- You have abundant memory (>32GB)
+</Accordion>
+
+## Comparing to Other Frameworks
+
+| Framework | F16 | Q8 | Q4 |
+|-----------|-----|----|----|
+| **UNC** | ✅ | ✅ Q8_0 | ✅ Q4_0 |
+| **mlx-lm** | ✅ | ✅ Q8 | ✅ Q4 (different packing) |
+| **llama.cpp** | ✅ | ✅ Q8_0 | ✅ Q4_0, Q4_1, Q4_K_M, ... |
+| **GGML** | ✅ | ✅ | ✅ Many variants |
+
+UNC's Q4_0 format is compatible with GGML/llama.cpp's Q4_0 block structure, but weights must be re-quantized (UNC loads from HuggingFace safetensors, not GGUF).
+
+## Implementation Notes
+
+### Quantization Happens At:
+
+1. **Compile time** (for AOT binaries):
+   - Weights are quantized and embedded in the binary
+   - No runtime quantization overhead
+
+2. **Load time** (for JIT bundles):
+   - F16 weights are mmap'd directly from safetensors
+   - Q8_0/Q4_0 weights are quantized on-the-fly during first load
+   - Quantized weights can be cached to avoid re-quantization
+
+### Activation Precision
+
+**All activations use F16 or F32**, never quantized:
+- Forward pass computations are F16 on Metal
+- Accumulation uses F32 for numerical stability (see `ir/types.rs:200-203`)
+- Only weights are quantized — activations are full precision
+
+```rust
+pub fn accum_dtype(&self) -> DType {
+    DType::F32  // Always accumulate in f32 for all weight dtypes
+}
+```
+
+This hybrid approach (quantized weights, full-precision activations) maintains quality while achieving memory/bandwidth savings.

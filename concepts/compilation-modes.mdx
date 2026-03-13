@@ -1,0 +1,277 @@
+---
+title: 'Compilation Modes'
+description: 'Understanding JIT bundles vs AOT standalone binaries'
+---
+
+## Overview
+
+UNC supports two output modes optimized for different use cases:
+
+| Mode | Output | Compilation | Use Case |
+|------|--------|-------------|----------|
+| **JIT (default)** | `.unc` bundle | JIT-compiled via clang on first run, cached thereafter | Development, iteration |
+| **AOT (`--binary`)** | Standalone Mach-O binary | Statically compiled, zero dependencies | Deployment, distribution |
+
+Both modes produce the same computational graph and achieve identical performance once loaded. The difference lies in packaging and startup behavior.
+
+## JIT Mode: .unc Bundles
+
+### What is a .unc Bundle?
+
+A `.unc` file is a binary container that packages:
+
+```
+┌─────────────────────────────────────┐
+│ Magic bytes: "UNC\x01"              │
+│ Format version: u32                 │
+├─────────────────────────────────────┤
+│ Serialized CompGraph (bincode)      │
+│  • IR nodes with operations         │
+│  • Tensor metadata                  │
+│  • Kernel assignments               │
+│  • Model parameters                 │
+├─────────────────────────────────────┤
+│ Compilation statistics (JSON)       │
+│  • Memory plan summary              │
+│  • Fusion count                     │
+│  • Kernel launch count              │
+├─────────────────────────────────────┤
+│ Orchestrator source (Obj-C)         │
+│  • unc_init() implementation        │
+│  • unc_forward() implementation     │
+│  • Metal buffer management          │
+├─────────────────────────────────────┤
+│ Metallib path (string)              │
+│  • Points to compiled .metallib     │
+└─────────────────────────────────────┘
+```
+
+<Note>
+The `.unc` format is defined in `src/unc_format/serialize.rs:11-65`. It uses bincode for efficient graph serialization and JSON for human-readable statistics.
+</Note>
+
+### JIT Compilation Process
+
+On first run, the UNC runtime (`src/runtime/`):
+
+1. **Deserializes** the graph from the `.unc` file
+2. **Writes** the orchestrator source to a temporary `.m` file
+3. **Compiles** with clang: `clang -fobjc-arc -O2 -framework Metal`
+4. **Links** to produce a dynamic library (`.dylib`)
+5. **Caches** the compiled artifact for subsequent runs
+6. **Loads** weights via mmap from the original `.safetensors` files
+
+```bash
+# Compile to .unc bundle
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama
+
+# First run: JIT compiles orchestrator (1-2 seconds)
+unc run ./tinyllama.unc --prompt "Hello" --max-tokens 50
+
+# Subsequent runs: uses cached binary (instant startup)
+unc run ./tinyllama.unc --prompt "The history of" --max-tokens 100
+```
+
+**Compilation Cache Location**:
+- macOS: `~/Library/Caches/unc/compiled/<hash>.dylib`
+- Linux: `~/.cache/unc/compiled/<hash>.dylib`
+
+### Advantages of JIT Mode
+
+<Accordion title="Development Iteration">
+- **Fast compile times**: Serializing the graph is instant
+- **Easy inspection**: Orchestrator source is readable Obj-C
+- **Debugging**: Can modify generated code and recompile manually
+- **Small output**: Only stores IR + metadata, not full binary
+</Accordion>
+
+<Accordion title="Weight Sharing">
+Multiple `.unc` files can reference the same HuggingFace model weights, avoiding duplication. Weights stay in the HuggingFace cache and are mmap'd on demand.
+</Accordion>
+
+### Disadvantages
+
+- **First-run latency**: 1-2 second clang compilation on initial load
+- **Dependency on HuggingFace cache**: Requires original model files to be present
+- **Requires clang**: Runtime needs Xcode Command Line Tools installed
+
+## AOT Mode: Standalone Binaries
+
+### What is an AOT Binary?
+
+An AOT (Ahead-Of-Time) compiled binary is a self-contained Mach-O executable that embeds everything needed for inference:
+
+```
+┌─────────────────────────────────────┐
+│ Mach-O Header                       │
+│ Load Commands                       │
+├─────────────────────────────────────┤
+│ __TEXT segment                      │
+│  • Orchestrator code (unc_init, etc)│
+│  • Embedded metallib (byte array)   │
+│  • Tokenizer vocab + merges         │
+├─────────────────────────────────────┤
+│ __DATA segment                      │
+│  • Global state, buffers            │
+├─────────────────────────────────────┤
+│ Padding to 16KB boundary            │
+├─────────────────────────────────────┤
+│ Model weights (appended)            │
+│  • Quantized weight data            │
+├─────────────────────────────────────┤
+│ Trailer:                            │
+│  • 8 bytes: weight offset           │
+│  • 8 bytes: weight size             │
+│  • 8 bytes: magic "UNCW8TSX"        │
+└─────────────────────────────────────┘
+```
+
+<Note>
+The binary layout is defined in `src/emit/aot.rs:9`. Weights are appended after the code section to avoid bloating the Mach-O header, and the trailer enables the runtime to locate them via self-inspection.
+</Note>
+
+### AOT Build Process
+
+The AOT emitter (`src/emit/aot.rs:24-28`):
+
+1. **Generates** orchestrator Objective-C source (same as JIT)
+2. **Embeds** the compiled `.metallib` as a C byte array
+3. **Embeds** tokenizer vocabulary and merge rules
+4. **Compiles** to object code: `clang -c -fobjc-arc -O2`
+5. **Links** to Mach-O binary: `clang -framework Metal -framework Foundation`
+6. **Appends** quantized weights + trailer
+
+```bash
+# Compile to standalone binary
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 --binary -o ./tinyllama_aot
+
+# Run anywhere (no dependencies, instant startup)
+./tinyllama_aot --prompt "Hello" --max-tokens 50
+
+# Binary is self-contained and portable
+ls -lh ./tinyllama_aot
+# -rwxr-xr-x  1.2G  tinyllama_aot
+```
+
+### Advantages of AOT Mode
+
+<Accordion title="Zero Dependencies">
+- No HuggingFace cache required
+- No clang runtime compilation
+- No external tokenizer files
+- Fully self-contained executable
+</Accordion>
+
+<Accordion title="Instant Startup">
+- No JIT compilation step
+- Weights mmap'd directly from binary
+- Typical cold start: less than 100ms for 1.1B model
+</Accordion>
+
+<Accordion title="Easy Distribution">
+- Single file to deploy
+- Works on any macOS device with Metal support
+- No Python, no frameworks, no installation
+- Can be signed and notarized for distribution
+</Accordion>
+
+### Disadvantages
+
+- **Large file size**: Embeds all quantized weights (600MB–2GB+ depending on model and quantization)
+- **Longer compile time**: Full clang compile + link at build time (~10-30 seconds)
+- **Harder to inspect**: Orchestrator code is embedded, not easily accessible
+- **Weight duplication**: Each binary includes its own weight copy
+
+## Choosing a Mode
+
+### Use JIT (`.unc`) When:
+
+- **Developing** and iterating on compiler passes
+- **Experimenting** with different quantization levels
+- **Sharing** multiple models that use the same base weights
+- **Inspecting** generated orchestrator code for debugging
+- File size is a concern and weights can be shared
+
+### Use AOT (`--binary`) When:
+
+- **Deploying** to production environments
+- **Distributing** a model as a standalone application
+- **Targeting** end-users who don't have development tools installed
+- Startup latency must be minimal
+- Self-contained packaging is required (e.g., app bundle)
+
+## Implementation Details
+
+### JIT Runtime (`src/runtime/`)
+
+```rust
+// Deserialize .unc bundle
+let unc_data = read_unc(&unc_file)?;
+
+// Write orchestrator to temp file
+let src_path = cache_dir.join("orchestrator.m");
+std::fs::write(&src_path, &unc_data.orchestrator_source)?;
+
+// JIT compile
+let dylib_path = compile_orchestrator(&src_path)?;
+
+// Load and execute
+let lib = unsafe { libloading::Library::new(&dylib_path)? };
+let unc_init: Symbol<unsafe extern fn(...)> = unsafe { lib.get(b"unc_init")? };
+```
+
+### AOT Main (`src/emit/aot.rs:44-54`)
+
+The AOT main embeds:
+
+```c
+// Embedded metallib
+static const unsigned char metallib_data[] = { /* compiled .metallib bytes */ };
+static const size_t metallib_size = 124536;
+
+// Embedded tokenizer
+static const char* vocab[] = { "hello", "world", ... };
+static const char* merges[] = { "he llo", "wor ld", ... };
+
+// Embedded config
+static const uint32_t vocab_size = 32000;
+static const uint32_t bos_token_id = 1;
+static const uint32_t eos_token_id = 2;
+```
+
+At runtime, the binary reads its own file to locate appended weights:
+
+```objective-c
+// Read trailer from self
+FILE* self = fopen(argv[0], "rb");
+fseek(self, -24, SEEK_END);  // Last 24 bytes
+uint64_t weight_offset, weight_size;
+uint64_t magic;
+fread(&weight_offset, 8, 1, self);
+fread(&weight_size, 8, 1, self);
+fread(&magic, 8, 1, self);
+assert(magic == 0x5854385754434E55);  // "UNCW8TSX"
+
+// mmap weights from self
+void* weights = mmap(NULL, weight_size, PROT_READ, MAP_PRIVATE, 
+                     fileno(self), weight_offset);
+```
+
+<Warning>
+AOT binaries must not be stripped with `strip` as this removes the appended weight section. Use `strip -S` to preserve the trailer if symbol stripping is required.
+</Warning>
+
+## Performance Comparison
+
+Both modes achieve identical inference performance:
+
+| Metric | JIT | AOT |
+|--------|-----|-----|
+| Throughput (tok/s) | 152.0 | 152.0 |
+| GPU power (W) | 11.3 | 11.3 |
+| Energy per token (mJ) | 74 | 74 |
+| **Cold start latency** | 1.2s (first run) | 0.08s |
+| **Warm start latency** | 0.1s (cached) | 0.08s |
+| **File size** | 2MB (+ cached dylib) | 1.2GB (self-contained) |
+
+The runtime execution graph is identical — only packaging and startup differ.

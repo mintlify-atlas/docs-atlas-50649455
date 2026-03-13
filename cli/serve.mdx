@@ -1,0 +1,101 @@
+---
+title: "unc serve"
+description: "Start an OpenAI-compatible API server"
+---
+
+The `serve` command starts an HTTP server that exposes an OpenAI-compatible API for running inference on a compiled model.
+
+<Warning>
+  This command is currently **not yet implemented**. The CLI accepts the command but does not start a server.
+</Warning>
+
+## Usage
+
+```bash
+unc serve <UNC_FILE> [OPTIONS]
+```
+
+## Parameters
+
+<ParamField path="unc_file" type="path" required>
+  Path to the compiled `.unc` model file to serve.
+</ParamField>
+
+<ParamField path="--port" type="integer" default="8080">
+  Port number for the HTTP server.
+</ParamField>
+
+<ParamField path="--verbose" type="boolean">
+  Enable verbose debug logging (global flag).
+</ParamField>
+
+## Examples
+
+### Start server on default port
+
+```bash
+unc serve llama2-7b.unc
+```
+
+Current output:
+```
+unc serve llama2-7b.unc on port 8080 (not yet implemented)
+```
+
+### Start server on custom port
+
+```bash
+unc serve mistral-7b.unc --port 3000
+```
+
+Current output:
+```
+unc serve mistral-7b.unc on port 3000 (not yet implemented)
+```
+
+## Planned Features
+
+When implemented, the server will provide:
+
+- **OpenAI-compatible API**: Drop-in replacement for OpenAI client libraries
+- **Chat completions**: `/v1/chat/completions` endpoint
+- **Text completions**: `/v1/completions` endpoint
+- **Model listing**: `/v1/models` endpoint
+- **Streaming support**: Server-sent events for real-time token streaming
+
+## Expected Usage (Future)
+
+Once implemented, you'll be able to use standard OpenAI client libraries:
+
+```python
+import openai
+
+client = openai.OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="not-needed"
+)
+
+response = client.chat.completions.create(
+    model="model",
+    messages=[
+        {"role": "user", "content": "Hello!"}
+    ]
+)
+
+print(response.choices[0].message.content)
+```
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "model",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+## Notes
+
+- This feature is on the roadmap but not yet available
+- Use `unc run` for immediate inference needs
+- Check the project repository for implementation progress

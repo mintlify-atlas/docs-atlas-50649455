@@ -1,0 +1,107 @@
+---
+title: "unc run"
+description: "Run inference on a compiled .unc model"
+---
+
+The `run` command executes text generation inference on a compiled `.unc` model bundle.
+
+## Usage
+
+```bash
+unc run <UNC_FILE> [OPTIONS]
+```
+
+## Parameters
+
+<ParamField path="unc_file" type="path" required>
+  Path to the compiled `.unc` model file.
+</ParamField>
+
+<ParamField path="--prompt" type="string" default="Hello, ">
+  Input prompt for text generation.
+</ParamField>
+
+<ParamField path="--max-tokens" type="integer" default="200">
+  Maximum number of tokens to generate.
+</ParamField>
+
+<ParamField path="--verbose" type="boolean">
+  Enable verbose debug logging (global flag).
+</ParamField>
+
+## Examples
+
+### Basic inference
+
+Run inference with default prompt:
+
+```bash
+unc run llama2-7b.unc
+```
+
+Output:
+```
+Hello, I'm a 30-year-old software engineer from San Francisco. I've been working in the tech industry for about 8 years now...
+```
+
+### Custom prompt
+
+Generate text from a custom prompt:
+
+```bash
+unc run llama2-7b.unc --prompt "Explain quantum computing in simple terms:"
+```
+
+Output:
+```
+Explain quantum computing in simple terms: Quantum computing is a revolutionary approach to computation that leverages the principles of quantum mechanics. Unlike classical computers that use bits (0 or 1), quantum computers use quantum bits or qubits...
+```
+
+### Control output length
+
+Limit generation to 50 tokens:
+
+```bash
+unc run mistral-7b.unc \
+  --prompt "Write a haiku about coding:" \
+  --max-tokens 50
+```
+
+### Multi-line prompts
+
+Use quotes for multi-line prompts:
+
+```bash
+unc run qwen2-7b.unc --prompt "You are a helpful assistant.
+
+User: What is the capital of France?
+Assistant:"
+```
+
+### Verbose mode
+
+See detailed execution information:
+
+```bash
+unc run gemma-2b.unc \
+  --prompt "Hello world" \
+  --verbose
+```
+
+## Metallib Resolution
+
+The runtime automatically resolves the Metal shader library (`.metallib`) using this priority:
+
+1. Path specified in the `.unc` bundle metadata (relative to `.unc` file location)
+2. `UNC_METALLIB_PATH` environment variable
+3. Same directory as the `.unc` file with `.metallib` extension
+
+For example, if running `models/llama2-7b.unc`, the runtime looks for `models/llama2-7b.metallib`.
+
+## Notes
+
+- Requires macOS with Metal support
+- The model must be compiled with `unc compile` first
+- Generation speed depends on model size, quantization, and hardware
+- The prompt is tokenized using the tokenizer embedded in the `.unc` bundle
+- Generation stops when reaching `max_tokens` or the model's EOS token

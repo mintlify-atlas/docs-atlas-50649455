@@ -1,0 +1,310 @@
+---
+title: "Optimization Passes"
+description: "Graph transformations and fusion patterns in the UNC compiler"
+---
+
+## Overview
+
+Optimization passes transform the computation graph to reduce memory bandwidth, kernel launches, and overall latency. UNC implements several key optimizations:
+
+- **Dead Code Elimination (DCE)** - Removes unused nodes
+- **QKV Fusion** - Combines query/key/value projections
+- **Elementwise Fusion** - Merges memory-bound operations
+- **Dual-Path Insertion** - Adds prefill/decode branching
+
+## Dead Code Elimination
+
+DCE removes graph nodes whose outputs are not consumed by any downstream node or graph output. This is crucial after fusion passes that may orphan intermediate nodes.
+
+### Implementation
+
+From `src/compile/passes/dce.rs`:
+
+```rust
+pub fn eliminate_dead_code(graph: &mut CompGraph) {
+    // Collect all tensor IDs that are used as inputs or are graph outputs
+    let mut used: HashSet<TensorId> = HashSet::new();
+
+    for tid in &graph.outputs {
+        used.insert(*tid);
+    }
+    for node in &graph.nodes {
+        for input in &node.inputs {
+            used.insert(*input);
+        }
+    }
+
+    // Remove nodes whose primary output is not used
+    let before = graph.nodes.len();
+    graph.nodes.retain(|node| used.contains(&node.output));
+
+    // Rebuild node_map
+    graph.node_map.clear();
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        graph.node_map.insert(node.id, idx);
+    }
+
+    let removed = before - graph.nodes.len();
+    if removed > 0 {
+        log::debug!("DCE: removed {removed} dead nodes");
+    }
+}
+```
+
+<Note>
+DCE runs twice in the default pipeline - once early and once after fusion passes to catch nodes orphaned by transformations.
+</Note>
+
+## QKV Fusion
+
+Transformer attention layers compute three matrix multiplications with the same input tensor. QKV fusion combines these into a single kernel launch.
+
+### Pattern Detection
+
+From `src/compile/passes/qkv_fusion.rs`:
+
+```rust
+pub fn fuse_qkv(graph: &mut CompGraph) -> usize {
+    // Find all MatMul nodes, grouped by their first input
+    let mut input_to_matmuls: HashMap<TensorId, Vec<usize>> = HashMap::new();
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        if matches!(node.op, Op::MatMul) && node.inputs.len() >= 2 {
+            let x = node.inputs[0];
+            input_to_matmuls.entry(x).or_default().push(idx);
+        }
+    }
+
+    // Find groups of exactly 3 MatMuls with the same input (Q, K, V)
+    let fusion_groups: Vec<[usize; 3]> = input_to_matmuls
+        .values()
+        .filter(|idxs| idxs.len() == 3)
+        .map(|idxs| [idxs[0], idxs[1], idxs[2]])
+        .collect();
+}
+```
+
+### Fusion Strategy
+
+The pattern matcher looks for:
+
+```
+q = MatMul(x, Wq)
+k = MatMul(x, Wk)  
+v = MatMul(x, Wv)
+```
+
+And transforms it to:
+
+```
+qkv = Fused(QKVProjection)(x, Wq, Wk, Wv)
+```
+
+<Info>
+QKV fusion is deferred to emit time when weight tensors are concatenated. The pass identifies candidates, and the code generator produces a single kernel dispatch.
+</Info>
+
+## Elementwise Fusion
+
+Memory-bound elementwise operations (activations, scaling, addition) are natural fusion candidates. The current implementation focuses on SwiGLU patterns.
+
+### SwiGLU Gate Pattern
+
+From `src/compile/passes/elementwise_fusion.rs`:
+
+```rust
+pub fn fuse_elementwise(graph: &mut CompGraph) -> usize {
+    let mut fused = 0;
+
+    // Pattern: SiLU(gate) followed immediately by Mul(silu_out, up)
+    for i in 0..graph.nodes.len() {
+        if matches!(graph.nodes[i].op, Op::SiLU) {
+            let silu_out = graph.nodes[i].output;
+            // Find a Mul node that consumes this output
+            for j in (i + 1)..graph.nodes.len() {
+                if matches!(graph.nodes[j].op, Op::Mul)
+                    && graph.nodes[j].inputs.contains(&silu_out)
+                {
+                    // Found SiLU → Mul (SwiGLU gate)
+                    fused += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    if fused > 0 {
+        log::debug!("Elementwise fusion: found {fused} SwiGLU gate patterns");
+    }
+    0 // deferred to emit time
+}
+```
+
+This identifies the common pattern in Llama-style FFN blocks:
+
+```python
+gate = silu(x @ W_gate)
+up = x @ W_up
+output = gate * up
+```
+
+<Warning>
+Elementwise fusion currently identifies patterns but defers actual fusion to code generation. Future versions may perform graph rewriting in the pass itself.
+</Warning>
+
+## Dual-Path Insertion
+
+LLM inference has two distinct phases:
+- **Prefill**: Process input prompt (seq_len greater than 1, compute-bound GEMM)
+- **Decode**: Generate one token at a time (seq_len = 1, memory-bound GEMV)
+
+Dual-path insertion marks matrix multiplication nodes to use different kernels for each phase.
+
+### Implementation
+
+From `src/compile/passes/dual_path.rs`:
+
+```rust
+pub fn insert_dual_paths(
+    graph: &mut CompGraph, 
+    _registry: &KernelRegistry, 
+    _target: &Target
+) {
+    for node in graph.nodes.iter_mut() {
+        if !is_gemm_op(&node.op) {
+            continue;
+        }
+
+        // Mark as needing dual-path resolution
+        // The kernel_matching pass will fill in the real kernel IDs
+        if node.kernel.is_none() {
+            node.estimated_cost = Some(f64::MAX); // will be replaced
+        }
+    }
+}
+
+fn is_gemm_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::MatMul | 
+        Op::BatchMatMul { .. } | 
+        Op::QuantizedMatMul { .. } | 
+        Op::LogitProjection
+    )
+}
+```
+
+### Runtime Branching
+
+The code generator emits a runtime check:
+
+```swift
+if seq_len > 1 {
+    // Dispatch prefill kernel (GEMM)
+    encoder.dispatchThreadgroups(prefill_grid, threadsPerThreadgroup: prefill_block)
+} else {
+    // Dispatch decode kernel (GEMV)
+    encoder.dispatchThreadgroups(decode_grid, threadsPerThreadgroup: decode_block)
+}
+```
+
+<Info>
+Dual-path execution allows the same compiled model to efficiently handle both initial prompt processing and autoregressive token generation.
+</Info>
+
+## Barrier Analysis
+
+When using concurrent Metal dispatch, the compiler must insert memory barriers to prevent read-after-write hazards.
+
+### Data-Flow Tracking
+
+From `src/compile/passes/barrier_analysis.rs`:
+
+```rust
+pub fn analyze_barriers(
+    units: &[DispatchUnit],
+    tensor_to_region: Option<&HashMap<TensorId, u32>>,
+) -> BarrierPlan {
+    let mut barrier_before = HashSet::new();
+    let mut pending_writes: HashSet<TensorId> = HashSet::new();
+
+    for (i, unit) in units.iter().enumerate() {
+        // Check if any read conflicts with pending writes
+        let conflicting_reads: Vec<&TensorId> = unit.reads.iter()
+            .filter(|read_tid| pending_writes.contains(read_tid))
+            .collect();
+
+        if !conflicting_reads.is_empty() {
+            barrier_before.insert(i);
+            pending_writes.clear();
+        }
+
+        // Add this dispatch's writes to pending set
+        for write_tid in &unit.writes {
+            pending_writes.insert(*write_tid);
+        }
+    }
+}
+```
+
+### Per-Resource Barriers
+
+With decode region tracking, the compiler can emit fine-grained barriers that only synchronize specific buffers:
+
+```rust
+if let Some(t2r) = tensor_to_region {
+    // Per-resource barrier: find which regions need barriering
+    let mut regions_to_barrier: HashSet<u32> = HashSet::new();
+    for read_tid in &conflicting_reads {
+        if let Some(&region) = t2r.get(read_tid) {
+            regions_to_barrier.insert(region);
+        }
+    }
+    
+    // Only clear pending writes for the barriered regions
+    pending_writes.retain(|tid| {
+        if let Some(&r) = t2r.get(tid) {
+            !regions_to_barrier.contains(&r)
+        } else {
+            true
+        }
+    });
+}
+```
+
+This allows unrelated operations to proceed without unnecessary synchronization.
+
+## Pass Statistics
+
+The compiler tracks metrics for each pass:
+
+```rust
+pub struct CompilationStats {
+    pub nodes_before: usize,
+    pub nodes_after: usize,
+    pub unique_kernels: usize,
+    pub fusions_applied: usize,
+    pub estimated_flops_per_token: f64,
+    pub peak_activation_bytes: usize,
+    pub kernel_launches_per_forward: usize,
+}
+```
+
+Example output:
+```
+DCE: removed 12 dead nodes
+QKV fusion: 32 groups identified (will be fused at emit time)
+Elementwise fusion: found 64 SwiGLU gate patterns
+Kernel matching: 428 matched, 0 unmatched, 47 unique kernels
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Compiler Pipeline" icon="diagram-project" href="/internals/compiler-pipeline">
+    Understanding the overall compilation flow
+  </Card>
+  <Card title="Kernel Matching" icon="microchip" href="/internals/kernel-matching">
+    Learn how kernels are selected for operations
+  </Card>
+</CardGroup>

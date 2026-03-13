@@ -1,0 +1,237 @@
+---
+title: Supported Models
+description: Complete list of supported transformer architectures and HuggingFace models in UNC
+---
+
+# Supported Models
+
+UNC supports major transformer architectures through HuggingFace model templates. All architectures share a common IR (intermediate representation) that compiles to optimized Metal kernels.
+
+## Supported Architectures
+
+You can list all supported architectures with:
+
+```bash
+unc list-architectures
+```
+
+Currently supported:
+
+<Tip>
+  All architectures use the same core IR graph with ops like `BatchMatMul`, `QuantizedMatVec`, `RMSNorm`, `RoPE`, `SDPA`, and `SwiGLU`. This enables consistent optimization across all model families.
+</Tip>
+
+## LLaMA
+
+**Architecture family**: LLaMA, LLaMA-2, LLaMA-3  
+**Template**: `src/frontend/templates/llama.rs`  
+**Features**: 
+- RMSNorm for layer normalization
+- SwiGLU, GeGLU, or standard FFN
+- Rotary position embeddings (RoPE)
+- Grouped query attention (GQA)
+- Optional QK normalization (Qwen3)
+
+**Supported variants**:
+- TinyLlama 1.1B
+- LLaMA-7B, 13B, 70B
+- LLaMA-2 variants
+- LLaMA-3 variants
+
+**Example**:
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama
+```
+
+**Benchmark** (TinyLlama 1.1B, M1 Pro):
+- Q4_0: 152.0 tok/s
+- Q8_0: 76.6 tok/s
+- F16: 47.9 tok/s
+
+## Mistral
+
+**Architecture family**: Mistral, Mixtral  
+**Template**: `src/frontend/templates/mistral.rs`  
+**Features**:
+- Uses LLaMA template with minor variations
+- Sliding window attention (SWA) support planned
+- Same weight naming conventions as LLaMA
+
+**Supported variants**:
+- Mistral-7B
+- Mixtral-8x7B (MoE support planned)
+
+**Example**:
+```bash
+unc compile --model mistralai/Mistral-7B-v0.1 --quant q4-0 -o ./mistral
+```
+
+<Note>
+  Sliding window attention is currently treated as full attention. Native SWA support is planned for future releases.
+</Note>
+
+## Qwen
+
+**Architecture family**: Qwen, Qwen-2, Qwen-3  
+**Template**: `src/frontend/templates/qwen.rs`  
+**Features**:
+- Same architecture as LLaMA with minor naming differences
+- Supports QK normalization for improved stability
+- Compatible with Qwen-2 and Qwen-3 series
+
+**Supported variants**:
+- Qwen-1.8B, 4B, 7B, 14B
+- Qwen-2 series
+- Qwen-3 series
+
+**Example**:
+```bash
+unc compile --model Qwen/Qwen3-4B --quant q4-0 -o ./qwen3
+```
+
+**Benchmark** (Qwen3-4B Q4_0, M1 Pro):
+- UNC: 38.7 tok/s
+- mlx-lm: 49.2 tok/s (1.27x faster for this model)
+
+<Warning>
+  UNC is currently 79% the speed of mlx-lm on Qwen3-4B. Optimization for larger models is ongoing.
+</Warning>
+
+## Phi
+
+**Architecture family**: Phi-2, Phi-3  
+**Template**: `src/frontend/templates/phi.rs`  
+**Features**:
+- Uses LLaMA-compatible template
+- Efficient small model architecture
+- Optimized for instruction following
+
+**Supported variants**:
+- Phi-2 (2.7B)
+- Phi-3-mini (3.8B)
+- Phi-3-small, Phi-3-medium
+
+**Example**:
+```bash
+unc compile --model microsoft/phi-2 --quant q4-0 -o ./phi2
+```
+
+## Gemma
+
+**Architecture family**: Gemma, Gemma-2  
+**Template**: `src/frontend/templates/gemma.rs`  
+**Features**:
+- LLaMA-compatible architecture
+- Uses GeGLU activation
+- Supports both Gemma and Gemma-2 series
+
+**Supported variants**:
+- Gemma-2B, 7B
+- Gemma-2-9B, 27B
+
+**Example**:
+```bash
+unc compile --model google/gemma-2b --quant q4-0 -o ./gemma
+```
+
+## Architecture Comparison
+
+| Architecture | Norm | FFN Activation | Attention | Template |
+|--------------|------|----------------|-----------|----------|
+| LLaMA | RMSNorm | SwiGLU | GQA + RoPE | `llama.rs` |
+| Mistral | RMSNorm | SwiGLU | GQA + RoPE + SWA | `mistral.rs` |
+| Qwen | RMSNorm | SwiGLU | GQA + RoPE + QKNorm | `qwen.rs` |
+| Phi | RMSNorm | GeGLU | GQA + RoPE | `phi.rs` |
+| Gemma | RMSNorm | GeGLU | GQA + RoPE | `gemma.rs` |
+
+## Common Operations
+
+All architectures share these IR operations:
+
+**Linear transformations**:
+- `MatMul`: Standard matrix multiplication (prefill phase)
+- `QuantizedMatVec`: Optimized matrix-vector for decode
+
+**Normalization**:
+- `RMSNorm`: Root Mean Square normalization
+- `LayerNorm`: Standard layer normalization (rarely used)
+- `QKNorm`: Per-head Q/K normalization (Qwen3)
+
+**Attention**:
+- `ScaledDotProductAttention` (SDPA): Fused attention with causal masking
+- `RoPE`: Rotary position embeddings
+- `KVCacheAppend`: Efficient KV cache management
+
+**Activations**:
+- `SwiGLU`: Swish-Gated Linear Unit
+- `GeGLU`: GELU-Gated Linear Unit
+- `SiLU`, `GELU`: Standard activations
+
+**Other**:
+- `Gather`: Embedding lookup
+- `Add`, `Mul`: Element-wise operations
+- `LogitProjection`: Final token prediction
+
+## Verifying Model Compatibility
+
+To check if a HuggingFace model is supported:
+
+<Steps>
+  <Step title="Check the model's config.json">
+    Visit the model page on HuggingFace and look for `model_type` in `config.json`:
+    
+    ```json
+    {
+      "model_type": "llama",  // or "mistral", "qwen2", "phi", "gemma"
+      ...
+    }
+    ```
+  </Step>
+
+  <Step title="Verify architecture is supported">
+    Match `model_type` against supported architectures:
+    - `llama` → LLaMA template
+    - `mistral` → Mistral template
+    - `qwen2` → Qwen template
+    - `phi` → Phi template
+    - `gemma` → Gemma template
+  </Step>
+
+  <Step title="Test compilation">
+    ```bash
+    unc compile --model <model-name> --quant q4-0 -o ./test
+    ```
+    
+    If compilation succeeds, the model is fully supported.
+  </Step>
+</Steps>
+
+## Planned Architecture Support
+
+Upcoming support for:
+
+- **Mixtral MoE**: Sparse mixture-of-experts routing
+- **Falcon**: Multi-query attention variants
+- **MPT**: MosaicML Pretrained Transformer
+- **GPT-NeoX**: EleutherAI models
+
+## Backend Support
+
+Current backend support:
+
+| Backend | Status | Output |
+|---------|--------|--------|
+| Metal | ✅ Stable | Mach-O binary / .unc bundle |
+| CUDA | 🔜 Planned | PTX kernels |
+| ROCm | 🔜 Planned | HIP kernels |
+| WASM | 🔜 Planned | WebGPU shaders |
+
+<Note>
+  All architectures use the same hardware-agnostic IR. When CUDA/ROCm/WASM backends are implemented, all existing models will automatically work on those platforms.
+</Note>
+
+## Next Steps
+
+- [Model Compilation](/guides/model-compilation) - Learn how to compile models
+- [Quantization Options](/guides/quantization-options) - Choose the right precision
+- [Performance Tuning](/guides/performance-tuning) - Optimize for your hardware

@@ -1,0 +1,143 @@
+---
+title: "unc compile"
+description: "Compile a HuggingFace model to a .unc bundle or standalone binary"
+---
+
+The `compile` command downloads a model from HuggingFace and compiles it into an optimized Metal inference bundle or standalone binary.
+
+## Usage
+
+```bash
+unc compile --model <MODEL_ID> --output <PATH> [OPTIONS]
+```
+
+## Parameters
+
+<ParamField path="--model" type="string" required>
+  HuggingFace model identifier (e.g., `meta-llama/Llama-2-7b-hf`)
+</ParamField>
+
+<ParamField path="--output" type="path" required>
+  Output path for the compiled model. Automatically gets `.unc` extension unless `--binary` is used.
+</ParamField>
+
+<ParamField path="--quant" type="enum" default="f16">
+  Quantization format for model weights.
+  
+  Options:
+  - `f32` - 32-bit floating point
+  - `f16` - 16-bit floating point (default)
+  - `bf16` - Brain float 16
+  - `q8_0` - 8-bit quantization
+  - `q4_0` - 4-bit quantization
+</ParamField>
+
+<ParamField path="--max-seq-len" type="integer" default="4096">
+  Maximum sequence length for the model context window.
+</ParamField>
+
+<ParamField path="--hf-token" type="string">
+  HuggingFace API token for accessing gated models. Can also be set via `HF_TOKEN` environment variable.
+</ParamField>
+
+<ParamField path="--binary" type="boolean">
+  Produce a standalone Mach-O binary instead of a `.unc` bundle.
+</ParamField>
+
+<ParamField path="--unfused" type="boolean">
+  Generate unfused dispatches (MLX-style) with concurrent encoder and lazy barriers.
+</ParamField>
+
+<ParamField path="--verbose" type="boolean">
+  Enable verbose debug logging (global flag).
+</ParamField>
+
+## Examples
+
+### Basic compilation
+
+Compile a model with default settings:
+
+```bash
+unc compile --model meta-llama/Llama-2-7b-chat-hf --output llama2-7b
+```
+
+Output:
+```
+unc: compiling meta-llama/Llama-2-7b-chat-hf → llama2-7b.unc
+  arch=LLaMA, layers=32, heads=32 (kv=32), hidden=4096, ffn=11008
+  graph: 1847 nodes, quant: f16
+  registry: 12 kernels for Metal M3 Max
+  compile: 1847 nodes, 8 kernels, activation=256 MB, kv=512 MB
+Done → llama2-7b.unc
+```
+
+### Compile with quantization
+
+Use 4-bit quantization to reduce model size:
+
+```bash
+unc compile \
+  --model mistralai/Mistral-7B-v0.1 \
+  --output mistral-7b \
+  --quant q4_0
+```
+
+### Compile with custom sequence length
+
+Set a larger context window:
+
+```bash
+unc compile \
+  --model Qwen/Qwen2-7B \
+  --output qwen2-7b \
+  --max-seq-len 8192
+```
+
+### Compile gated model
+
+Access a gated model using HuggingFace token:
+
+```bash
+export HF_TOKEN=hf_xxxxxxxxxxxxx
+unc compile --model meta-llama/Llama-3-70b --output llama3-70b
+```
+
+Or pass the token directly:
+
+```bash
+unc compile \
+  --model meta-llama/Llama-3-70b \
+  --output llama3-70b \
+  --hf-token hf_xxxxxxxxxxxxx
+```
+
+### Generate standalone binary
+
+Produce a Mach-O executable instead of a bundle:
+
+```bash
+unc compile \
+  --model microsoft/phi-2 \
+  --output phi2 \
+  --binary
+```
+
+### Verbose compilation
+
+Enable debug logging to see detailed compilation steps:
+
+```bash
+unc compile \
+  --model google/gemma-2b \
+  --output gemma-2b \
+  --verbose
+```
+
+## Notes
+
+- Compilation requires macOS with Metal support
+- Models are cached in `~/.cache/huggingface` by default
+- The `.unc` bundle includes the computation graph, memory plan, and kernel list
+- Standalone binaries are larger but self-contained
+- Lower quantization levels (q4_0, q8_0) reduce model size but may impact quality

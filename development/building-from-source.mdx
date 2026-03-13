@@ -1,0 +1,238 @@
+---
+title: "Building from Source"
+description: "Step-by-step instructions to compile UNC from source on macOS"
+---
+
+UNC requires the Rust toolchain and Xcode Command Line Tools to build Metal shaders and C runtime components.
+
+## Prerequisites
+
+<Steps>
+
+### Install Rust
+
+Install the latest stable Rust toolchain via rustup:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Restart your shell or run:
+
+```bash
+source "$HOME/.cargo/env"
+```
+
+Verify installation:
+
+```bash
+rustc --version
+cargo --version
+```
+
+### Install Xcode Command Line Tools (macOS only)
+
+Required for:
+- `xcrun metal` - Metal shader compiler
+- `xcrun metallib` - Metal library linker
+- `clang` - JIT compilation of orchestrator code
+
+```bash
+xcode-select --install
+```
+
+Verify installation:
+
+```bash
+xcrun --version
+clang --version
+```
+
+<Note>
+Full Xcode installation is **not** required — Command Line Tools are sufficient.
+</Note>
+
+</Steps>
+
+## Build Process
+
+<Steps>
+
+### Clone the Repository
+
+```bash
+git clone <repo-url>
+cd unc
+```
+
+### Build Release Binary
+
+```bash
+cargo build --release
+```
+
+The compiled binary will be at:
+```
+target/release/unc
+```
+
+**Build time:** ~2-5 minutes (depending on hardware)
+
+### Verify Installation
+
+```bash
+./target/release/unc --version
+```
+
+Expected output:
+```
+unc 0.1.0
+```
+
+</Steps>
+
+## What Happens During Build
+
+The `build.rs` script runs automatically during `cargo build` and performs:
+
+<Steps>
+
+### 1. C Runtime Compilation
+
+Compiles C runtime components via the `cc` crate:
+
+```c
+runtime/runtime.c      // JIT execution harness
+runtime/api_server.c   // OpenAI API server (planned)
+runtime/repl.c         // Interactive REPL (planned)
+```
+
+Output: `libunc_runtime.a` (statically linked into the Rust binary)
+
+### 2. Metal Shader Compilation (macOS only)
+
+Compiles custom Metal kernels from `kernel_sources/metal/unc_kernels/`:
+
+<CodeGroup>
+
+```bash Step 1: .metal → .air
+xcrun -sdk macosx metal \
+  -c kernel.metal \
+  -I kernel_sources/metal/unc_kernels \
+  -I kernel_sources/metal/upstream_mlx \
+  -std=metal3.0 \
+  -o kernel.air
+```
+
+```bash Step 2: .air → .metallib
+xcrun -sdk macosx metallib \
+  *.air \
+  -o unc_kernels.metallib
+```
+
+</CodeGroup>
+
+The metallib path is embedded as the `UNC_METALLIB_PATH` environment variable at compile time.
+
+### 3. Rust Compilation
+
+Cargo compiles the Rust codebase with dependencies:
+- Metal API bindings (`metal` crate)
+- HuggingFace Hub client (`hf-hub`)
+- Safetensors parser
+- Tokenizers
+
+</Steps>
+
+## Development Build
+
+For faster iteration during development (unoptimized, with debug symbols):
+
+```bash
+cargo build
+```
+
+Binary location: `target/debug/unc`
+
+<Note>
+Debug builds are **significantly slower** at runtime (10-50x). Always use `--release` for performance testing.
+</Note>
+
+## Troubleshooting
+
+### Metal Shader Compilation Fails
+
+**Symptom:**
+```
+cargo:warning=xcrun metal not available
+```
+
+**Fix:**
+Install Xcode Command Line Tools:
+```bash
+xcode-select --install
+```
+
+### Missing C Compiler
+
+**Symptom:**
+```
+error: failed to run custom build command for `unc`
+cc: command not found
+```
+
+**Fix:**
+Install Xcode Command Line Tools (includes `clang`).
+
+### Rust Toolchain Not Found
+
+**Symptom:**
+```bash
+command not found: cargo
+```
+
+**Fix:**
+Ensure Rust is installed and shell is restarted:
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+## Running Tests
+
+Run the test suite:
+
+```bash
+cargo test --release
+```
+
+Tests include:
+- IR graph construction and optimization passes
+- Memory planner correctness
+- Kernel registry matching
+- Quantization accuracy (with `approx` crate)
+
+## Building for Distribution
+
+To build a portable binary:
+
+```bash
+cargo build --release --target aarch64-apple-darwin
+```
+
+The resulting binary at `target/aarch64-apple-darwin/release/unc` can be distributed to other Apple Silicon Macs.
+
+<Note>
+For maximum portability, use the `--binary` flag when compiling models to produce standalone Mach-O binaries with embedded weights (zero dependencies).
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Project Structure" icon="folder-tree" href="/development/project-structure">
+    Understand UNC's codebase organization
+  </Card>
+  <Card title="Benchmarking" icon="chart-line" href="/development/benchmarking">
+    Measure performance and resource usage
+  </Card>
+</CardGroup>

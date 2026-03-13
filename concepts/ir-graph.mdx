@@ -1,0 +1,492 @@
+---
+title: 'IR Graph Structure'
+description: 'Understanding the intermediate representation and graph operations'
+---
+
+## Overview
+
+The UNC Intermediate Representation (IR) is a hardware-agnostic typed tensor computation graph that sits at the heart of the compiler. It abstracts away model-specific details (HuggingFace architectures) and hardware-specific details (Metal shaders), enabling aggressive optimization while maintaining target independence.
+
+**Key Principle**: The IR lives at the right abstraction level — above individual multiply-adds (too low for pattern matching) but below "TransformerBlock" (too high for kernel selection). Each operation maps cleanly to one or more kernel launches.
+
+## Core Components
+
+### CompGraph: The Computation Graph
+
+Defined in `src/ir/graph.rs:85-96`:
+
+```rust
+pub struct CompGraph {
+    pub nodes: Vec<Node>,                      // All operations in topo order
+    pub node_map: HashMap<NodeId, usize>,      // Fast node lookup
+    pub tensors: HashMap<TensorId, TensorRef>, // All tensor metadata
+    pub inputs: Vec<TensorId>,                 // Graph inputs (token IDs)
+    pub outputs: Vec<TensorId>,                // Graph outputs (logits)
+    pub metadata: GraphMetadata,               // Model config, params
+    next_node_id: u32,
+    next_tensor_id: u32,
+}
+```
+
+**Properties**:
+- **DAG (Directed Acyclic Graph)**: Nodes have dependencies, no cycles
+- **Topologically Sorted**: Nodes are ordered so all inputs are computed before use
+- **Fully Typed**: Every tensor has resolved shape and dtype before compilation
+- **Immutable IDs**: NodeId and TensorId are stable across passes
+
+### Node: A Single Operation
+
+Defined in `src/ir/graph.rs:16-26`:
+
+```rust
+pub struct Node {
+    pub id: NodeId,
+    pub op: Op,                           // The operation type
+    pub inputs: Vec<TensorId>,            // Input tensors
+    pub output: TensorId,                 // Primary output
+    pub extra_outputs: Vec<TensorId>,     // Additional outputs (e.g., Split)
+    pub attrs: AttrMap,                   // Op-specific attributes
+    pub kernel: Option<KernelAssignment>, // Assigned after kernel matching
+    pub estimated_cost: Option<f64>,      // FLOP estimate for scheduling
+}
+```
+
+**Lifecycle**:
+1. **Construction** (frontend): Op created with inputs/outputs, no kernel
+2. **Optimization** (passes): Op may be fused, rewritten, or eliminated
+3. **Kernel Matching** (compiler): Kernel assigned based on op + target
+4. **Emission** (backend): Kernel dispatched in generated orchestrator code
+
+### TensorRef: Fully-Typed Tensors
+
+Defined in `src/ir/types.rs:277-286`:
+
+```rust
+pub struct TensorRef {
+    pub id: TensorId,
+    pub shape: Shape,             // Dimensions (static or param)
+    pub dtype: DType,             // Data type (F16, Q4_0, etc.)
+    pub storage: StorageClass,    // Where data lives
+    pub strides: Option<Vec<usize>>, // Memory layout (None = row-major)
+}
+```
+
+## The Type System
+
+### Dimension Expressions
+
+UNC's key innovation is **parameterized dimensions** (`src/ir/types.rs:38-74`):
+
+```rust
+pub enum Dim {
+    Static(usize),      // Known at compile time: hidden_dim = 4096
+    Param(ParamDim),    // Known at runtime: seq_len ∈ [1, 8192]
+}
+
+pub struct ParamDim {
+    pub name: ParamName,   // SeqLen, TotalSeqLen, BatchSize
+    pub min: usize,        // Lower bound
+    pub max: usize,        // Upper bound (for allocation)
+    pub alignment: usize,  // SIMD alignment requirement
+}
+```
+
+**Why This Matters**:
+- **Weight dimensions are always `Static`**: Enables compile-time optimization
+- **Sequence dimensions are `Param`**: Supports variable-length input
+- **Bounded parameters**: Compiler allocates for `max`, dispatches for actual
+- **Alignment constraints**: Ensures vectorized kernel requirements are met
+
+**Example Shapes**:
+```rust
+// Embedding lookup output: [seq_len, hidden_dim]
+Shape([
+    Dim::Param(ParamDim { name: SeqLen, min: 1, max: 8192, alignment: 1 }),
+    Dim::Static(4096),
+])
+
+// Attention weight: [num_heads, head_dim, head_dim]
+Shape([
+    Dim::Static(32),
+    Dim::Static(128),
+    Dim::Static(128),
+])
+```
+
+### Storage Classes
+
+Every tensor has a storage class that determines memory management (`src/ir/types.rs:226-248`):
+
+<Accordion title="Weight: mmap'd from safetensors">
+```rust
+StorageClass::Weight(WeightBinding {
+    name: "model.layers.0.self_attn.q_proj.weight",
+    byte_offset: 1048576,       // Location in safetensors file
+    byte_size: 33554432,        // Size in bytes
+    file_shape: [4096, 4096],   // Original dimensions
+    file_dtype: DType::F16,     // Original dtype
+})
+```
+**Properties**:
+- Read-only, never modified during inference
+- Loaded via mmap (zero-copy)
+- Can be quantized on load (F16 → Q4_0)
+</Accordion>
+
+<Accordion title="Activation: Computed at runtime">
+```rust
+StorageClass::Activation {
+    buffer: Some(BufferId(3)),  // Assigned by memory planner
+}
+```
+**Properties**:
+- Reusable buffer allocated from pool
+- Lifetime-based aliasing (multiple tensors share buffer if non-overlapping)
+- Two allocations: prefill (max_seq_len) and decode (seq_len=1)
+</Accordion>
+
+<Accordion title="KVCache: Persistent state">
+```rust
+StorageClass::KVCache {
+    layer: 12,              // Which transformer layer
+    head_group: 0,          // For GQA: which head group
+    role: KVRole::Key,      // Key or Value
+}
+```
+**Properties**:
+- Pre-allocated for `max_position_embeddings`
+- Grows incrementally during generation
+- Separate K/V buffers per layer
+</Accordion>
+
+<Accordion title="Constant: Compile-time data">
+```rust
+StorageClass::Constant {
+    data: vec![/* RoPE frequency table */],
+}
+```
+**Properties**:
+- Embedded in orchestrator code or metallib
+- Never changes during execution
+- Examples: RoPE freqs, causal mask template
+</Accordion>
+
+## Operation Types
+
+UNC defines ~30 core operations in `src/ir/ops.rs:11-97`:
+
+### Matrix Operations
+
+```rust
+Op::MatMul                           // [M, K] × [K, N] → [M, N]
+Op::BatchMatMul { transpose_b }     // [B, M, K] × [B, K, N] → [B, M, N]
+Op::MatVec                           // [M, K] × [K] → [M] (decode-optimized)
+```
+
+**Usage**: Linear layers, attention projections
+
+### Quantized Operations
+
+```rust
+Op::QuantizedMatMul { weight_dtype: DType::Q4_0 }
+Op::QuantizedMatVec { weight_dtype: DType::Q4_0 }
+```
+
+**Usage**: Same as MatMul/MatVec but with dequantization in kernel
+
+### Normalization
+
+```rust
+Op::RMSNorm { eps: 1e-6 }           // Root Mean Square normalization
+Op::LayerNorm { eps: 1e-5 }         // Standard layer norm
+Op::QKNorm {                        // Per-head Q/K normalization (Qwen3)
+    eps: 1e-6,
+    num_heads: 32,
+    head_dim: 128,
+}
+```
+
+**Usage**: Pre-attention, pre-FFN normalization layers
+
+### Attention
+
+```rust
+Op::ScaledDotProductAttention {
+    causal: true,              // Apply causal mask
+    gqa_factor: 4,             // Grouped Query Attention (num_q_heads / num_kv_heads)
+    head_dim: 128,             // Dimension per head
+    scale: 0.0883,             // 1/sqrt(head_dim)
+    has_mask: false,           // Additional attention mask
+    has_sinks: false,          // Sink tokens (streaming LLM)
+}
+```
+
+**What it does**: Fused `QK^T → softmax → V` in a single kernel launch
+
+**Equivalent pseudocode**:
+```python
+scores = (Q @ K.T) * scale        # [batch, heads, seq, total_seq]
+if causal:
+    scores = scores.masked_fill(causal_mask, -inf)
+attn = softmax(scores, dim=-1)    # [batch, heads, seq, total_seq]
+output = attn @ V                 # [batch, heads, seq, head_dim]
+```
+
+### Positional Encoding
+
+```rust
+Op::RoPE {
+    base: 10000.0,     // Frequency base (theta)
+    interleaved: false // Rotation pattern
+}
+```
+
+**RoPE (Rotary Position Embedding)**: Applies sinusoidal rotations to Q/K to encode position information
+
+### Activations
+
+```rust
+Op::SiLU    // x * sigmoid(x)  — Swish activation
+Op::GELU    // Gaussian Error Linear Unit
+Op::ReLU    // Rectified Linear Unit
+```
+
+### Elementwise Operations
+
+```rust
+Op::Mul              // Element-wise multiplication
+Op::Add              // Element-wise addition
+Op::Scale { factor } // Multiply by constant
+```
+
+### Fused Operations
+
+Created by optimization passes:
+
+```rust
+Op::Fused(FusionPattern::SwiGLU)
+// Fuses: gate_proj → SiLU → Mul(up_proj) into single kernel
+
+Op::Fused(FusionPattern::QKVProjection { q_size, k_size, v_size })
+// Fuses: matmul(W_q) + matmul(W_k) + matmul(W_v) into single kernel
+
+Op::Fused(FusionPattern::RMSNormLinear)
+// Fuses: RMSNorm → MatMul into single kernel
+```
+
+<Note>
+Fusion patterns are recognized and applied by compiler passes (`src/compile/passes/qkv_fusion.rs`, `elementwise_fusion.rs`). They reduce kernel launches and improve memory locality.
+</Note>
+
+### Memory Operations
+
+```rust
+Op::Gather { axis }              // Index selection (embedding lookup)
+Op::Reshape { target_shape }     // Reinterpret dimensions (zero-copy)
+Op::Transpose { perm }           // Permute axes
+Op::Concatenate { axis }         // Concat tensors along axis
+Op::Split { axis, sizes }        // Split tensor into chunks
+```
+
+### KV Cache Operations
+
+```rust
+Op::KVCacheAppend {
+    layer: 12,
+    role: KVRole::Key,
+}
+```
+
+**What it does**: Appends new keys/values to the persistent KV cache for this layer
+
+**Pseudocode**:
+```python
+# kv_cache shape: [num_layers, num_kv_heads, max_seq, head_dim]
+# new_kv shape: [num_kv_heads, new_seq_len, head_dim]
+
+kv_cache[layer, :, cache_pos:cache_pos+new_seq_len, :] = new_kv
+cache_pos += new_seq_len
+```
+
+## Graph Construction
+
+Frontend templates construct the graph in topological order (`src/frontend/templates/llama.rs` example):
+
+```rust
+// 1. Create input tensor
+let input_ids = graph.new_tensor(
+    Shape([Dim::Param(seq_len), Dim::Static(1)]),
+    DType::I32,
+    StorageClass::Activation { buffer: None },
+);
+
+// 2. Embedding lookup
+let embed_tokens = graph.add_node(
+    Op::Gather { axis: 0 },
+    vec![embed_weight, input_ids],
+    embed_output,
+    attrs,
+);
+
+// 3. For each transformer layer:
+for layer_idx in 0..num_layers {
+    // RMSNorm
+    let norm_out = add_rmsnorm(graph, hidden_states, norm_weight, eps);
+    
+    // Attention
+    let attn_out = add_attention_block(graph, norm_out, layer_idx, ...);
+    
+    // Residual
+    let hidden_states = add_residual(graph, hidden_states, attn_out);
+    
+    // FFN block (RMSNorm → SwiGLU → Linear → Residual)
+    let ffn_out = add_ffn_block(graph, hidden_states, layer_idx, ...);
+    hidden_states = add_residual(graph, hidden_states, ffn_out);
+}
+
+// 4. Final norm + logit projection
+let logits = add_logit_head(graph, hidden_states, lm_head_weight);
+
+// 5. Mark outputs
+graph.outputs.push(logits);
+```
+
+## Kernel Assignment
+
+After optimization passes, the kernel matching pass (`src/compile/passes/kernel_matching.rs`) assigns kernels to each node:
+
+```rust
+pub struct KernelAssignment {
+    pub kernel_id: KernelId,
+    pub kernel_name: String,
+    pub dispatch: DispatchConfig,
+    pub path: ExecutionPath,
+}
+```
+
+### Execution Paths
+
+Many operations have **dual paths** for prefill vs decode:
+
+```rust
+pub enum ExecutionPath {
+    Prefill,    // GEMM kernel for batch/seq processing
+    Decode,     // GEMV kernel for single-token generation
+    Unified,    // Single kernel for both
+    Dual {      // Runtime branch based on seq_len
+        prefill_kernel: KernelId,
+        prefill_kernel_name: String,
+        prefill_dispatch: Box<DispatchConfig>,
+        decode_kernel: KernelId,
+        decode_kernel_name: String,
+        decode_dispatch: Box<DispatchConfig>,
+    },
+}
+```
+
+**Example**: Matrix multiply operation
+- **Prefill** (`seq_len=512`): Launch GEMM kernel with grid `[M/32, N/32]`
+- **Decode** (`seq_len=1`): Launch GEMV kernel with grid `[M]`, optimized for single vector
+
+The orchestrator generates runtime code:
+
+```objective-c
+if (seq_len > 1) {
+    [encoder setComputePipelineState:kernel_gemm_q4];
+    [encoder dispatchThreadgroups:MTLSizeMake(M/32, N/32, 1) 
+            threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+} else {
+    [encoder setComputePipelineState:kernel_gemv_q4];
+    [encoder dispatchThreadgroups:MTLSizeMake(M, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+```
+
+### Dispatch Configuration
+
+Kernel dispatch parameters can reference runtime values:
+
+```rust
+pub struct DispatchConfig {
+    pub grid: [DispatchDim; 3],
+    pub threadgroup: [u32; 3],
+    pub shared_memory_bytes: u32,
+}
+
+pub enum DispatchDim {
+    Static(u32),                       // Fixed: MTLSizeMake(256, 1, 1)
+    CeilDiv { param: ParamName, divisor: u32 },  // (seq_len + 31) / 32
+    Expr(ParamExpr),                   // Complex expressions
+}
+```
+
+**Example dispatch**:
+```rust
+DispatchConfig {
+    grid: [
+        DispatchDim::Static(4096 / 32),  // Static dimension (hidden_size / tile)
+        DispatchDim::CeilDiv { param: SeqLen, divisor: 8 },  // (seq_len + 7) / 8
+        DispatchDim::Static(1),
+    ],
+    threadgroup: [32, 8, 1],
+    shared_memory_bytes: 4096,
+}
+```
+
+Generates:
+```objective-c
+MTLSize grid = MTLSizeMake(128, (seq_len + 7) / 8, 1);
+MTLSize tg = MTLSizeMake(32, 8, 1);
+[encoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+```
+
+## Graph Inspection
+
+The compiled graph can be inspected via the `unc inspect` command:
+
+```bash
+unc inspect ./tinyllama.unc --dump-ir
+```
+
+**Sample Output**:
+```
+CompGraph:
+  Model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  Architecture: LLaMA
+  Nodes: 324 (before), 287 (after optimization)
+  Unique kernels: 18
+  Fusions applied: 44
+
+Nodes (topological order):
+  Node(0): Gather { axis: 0 } — kernel: gather_i32
+    inputs: [T(weight.0), T(input_ids)]
+    output: T(embed.0) [seq, 2048] f16
+
+  Node(1): RMSNorm { eps: 1e-6 } — kernel: rmsnorm_f16
+    inputs: [T(embed.0), T(norm.0.weight)]
+    output: T(attn_norm.0) [seq, 2048] f16
+
+  Node(2): Fused(QKVProjection { q_size: 2048, k_size: 256, v_size: 256 })
+    kernel: qkv_projection_q4_prefill (seq > 1)
+    kernel: qkv_projection_q4_decode (seq == 1)
+    inputs: [T(attn_norm.0), T(q_proj.0), T(k_proj.0), T(v_proj.0)]
+    outputs: [T(q.0), T(k.0), T(v.0)]
+  
+  ...
+```
+
+<Note>
+The IR is serialized to `.unc` files using bincode, making it compact and fast to load. The entire graph for a 1.1B model is ~2MB serialized.
+</Note>
+
+## Summary
+
+The IR graph is UNC's abstraction layer that enables:
+
+1. **Target Independence**: Same graph for Metal, CUDA, ROCm (future)
+2. **Aggressive Optimization**: Pattern matching, fusion, memory planning
+3. **Type Safety**: Fully-resolved shapes catch errors at compile time
+4. **Efficient Execution**: Direct mapping to optimized kernels
+5. **Debuggability**: Human-inspectable with `unc inspect`
+
+The IR strikes a balance: high-level enough to optimize, low-level enough to map efficiently to hardware.

@@ -1,0 +1,331 @@
+---
+title: Performance Tuning
+description: Tips and techniques for maximizing inference throughput on Apple Silicon
+---
+
+# Performance Tuning
+
+UNC achieves near-hardware-limit performance through aggressive compiler optimizations, kernel fusion, and Metal-specific tuning. This guide covers techniques to maximize throughput on your hardware.
+
+## Quick Wins
+
+<Steps>
+  <Step title="Use Q4_0 quantization">
+    ```bash
+    unc compile --model <model> --quant q4-0 -o ./model
+    ```
+    
+    Q4_0 delivers 3.2x speedup vs F16 on TinyLlama with minimal quality loss.
+  </Step>
+
+  <Step title="Use AOT mode for production">
+    ```bash
+    unc compile --model <model> --quant q4-0 --binary -o ./model
+    ```
+    
+    AOT eliminates JIT compilation overhead (~0.2s saved per run).
+  </Step>
+
+  <Step title="Keep your system cool">
+    Performance degrades 30-40% when thermal throttling kicks in (~100-150 tokens on sustained loads).
+    
+    - Use in well-ventilated area
+    - Enable fans/cooling
+    - Allow cooldown between long generations
+  </Step>
+</Steps>
+
+## Understanding Performance Characteristics
+
+### Decode Performance (Token Generation)
+
+Decode is the primary bottleneck - generating one token at a time after the initial prompt.
+
+**TinyLlama 1.1B Q4_0 on M1 Pro:**
+
+```
+Cold throughput:  152 tok/s
+Warm throughput:  100-110 tok/s (30-40% slower)
+Cold latency:     6.36 ms/tok
+Warm latency:     8.3-10.0 ms/tok
+```
+
+<Note>
+  "Cold" = first 50-100 tokens with idle GPU. "Warm" = sustained generation after thermal buildup. This 30-40% degradation is thermal throttling, not a software issue.
+</Note>
+
+### Bandwidth Utilization
+
+Inference is memory-bandwidth bound:
+
+| Metric | Value |
+|--------|-------|
+| Q4_0 weights | 618 MB (TinyLlama 1.1B) |
+| Effective bandwidth | ~97 GB/s |
+| M1 Pro peak bandwidth | 200 GB/s |
+| **Utilization** | **48%** |
+
+The 48% utilization represents near-optimal efficiency - the remaining bandwidth is consumed by activations, KV cache, and Metal driver overhead.
+
+### GPU Power Profile
+
+**Decode phase (TinyLlama Q4_0):**
+
+```
+GPU power:  11.3W (UNC) vs 14.1W (mlx-lm)
+CPU power:  0.9W (JIT) / 2.1W (AOT)
+SoC power:  12.1W (JIT) / 13.5W (AOT)
+```
+
+UNC uses **25% less GPU power** than mlx-lm while being 1.35x faster.
+
+## Compiler Optimizations
+
+UNC applies several optimization passes automatically:
+
+### Fusion Passes
+
+<Steps>
+  <Step title="QKV Fusion">
+    Fuses separate Q, K, V projection MatMuls into a single kernel dispatch
+    
+    **Benefit**: 3x fewer kernel launches, reduced dispatch overhead
+  </Step>
+
+  <Step title="Gate+Up Fusion">
+    Combines gate and up projections in SwiGLU/GeGLU FFN
+    
+    **Benefit**: 2x fewer MatMuls per layer
+  </Step>
+
+  <Step title="SwiGLU Fusion">
+    Fuses SiLU activation and element-wise multiply into one kernel
+    
+    **Benefit**: Eliminates intermediate activation buffer
+  </Step>
+
+  <Step title="Add+RMSNorm Fusion">
+    Combines residual addition and RMSNorm into single pass
+    
+    **Benefit**: Reduces memory traffic by 1 full tensor read/write
+  </Step>
+
+  <Step title="RoPE+KV Fusion">
+    Applies RoPE and appends to KV cache in one kernel
+    
+    **Benefit**: Eliminates temporary RoPE output buffer
+  </Step>
+</Steps>
+
+### Dual-Path GEMM/GEMV
+
+UNC selects optimal kernels based on batch size:
+
+- **Prefill** (seq > 1): BatchMatMul (GEMM)
+- **Decode** (seq = 1): QuantizedMatVec (GEMV)
+
+GEMV is highly optimized for single-token generation, providing 2-3x speedup vs generic GEMM.
+
+### Memory Planning
+
+**Buffer aliasing**: Reuses activation buffers across layers when tensors don't overlap in lifetime.
+
+**Result**: Reduces peak memory by ~30% vs naive allocation.
+
+## Hardware-Specific Tuning
+
+### Apple Silicon Variants
+
+| Chip | GPU Cores | Bandwidth | Expected Q4_0 Performance |
+|------|-----------|-----------|---------------------------|
+| M1 | 7-8 | 68 GB/s | ~90 tok/s (TinyLlama) |
+| M1 Pro | 14-16 | 200 GB/s | 152 tok/s (measured) |
+| M1 Max | 24-32 | 400 GB/s | ~300 tok/s (estimated) |
+| M2 | 8-10 | 100 GB/s | ~110 tok/s (estimated) |
+| M2 Pro | 16-19 | 200 GB/s | ~152 tok/s (similar to M1 Pro) |
+| M2 Max | 30-38 | 400 GB/s | ~300 tok/s (estimated) |
+| M3/M4 | Varies | Up to 546 GB/s | Scales with bandwidth |
+
+<Tip>
+  Performance scales almost linearly with memory bandwidth for small models (< 7B). For larger models, GPU core count becomes more important.
+</Tip>
+
+### Thermal Management
+
+Sustained inference causes thermal throttling:
+
+```
+GPU temp (idle):   66-70°C
+GPU temp (decode): 70-75°C
+Throttle onset:    ~100-150 tokens
+Performance drop:  30-40% (152 → 100-110 tok/s)
+```
+
+**Mitigation strategies**:
+
+1. **Batch inference**: Generate multiple responses in parallel when possible
+2. **Cooldown periods**: Allow 15-30s between long runs
+3. **External cooling**: Use laptop stand with fans
+4. **Lower ambient temperature**: Run in cooler environment
+
+<Warning>
+  MacBook Pro models throttle more aggressively than Mac Mini/Studio due to compact thermal design. Expect 20-30% lower sustained performance on laptops.
+</Warning>
+
+## CPU Efficiency
+
+UNC's compiled approach eliminates Python/framework overhead:
+
+| Metric | UNC JIT | UNC AOT | mlx-lm Q4 |
+|--------|---------|---------|----------|
+| CPU instructions (200 tok) | 5.33B | 3.75B | 31.4B |
+| User CPU time | 0.30s | 0.16s | 3.27s |
+| Context switches | ~4,000 | ~6,200 | ~15,700 |
+
+UNC executes **8.4x fewer CPU instructions** than mlx-lm, freeing up CPU cycles and reducing heat.
+
+**Why this matters**:
+- Less CPU heat → less thermal impact on GPU
+- Lower power draw → better battery life
+- More headroom for GPU → higher sustained throughput
+
+## Model Size Considerations
+
+### Small Models (< 2B)
+
+**Example**: TinyLlama 1.1B
+
+- **Bottleneck**: Memory bandwidth
+- **Optimization**: Maximize bandwidth efficiency through quantization (Q4_0)
+- **Expected**: 100-150 tok/s on M1 Pro
+
+### Medium Models (2-7B)
+
+**Example**: Qwen3-4B, Mistral-7B
+
+- **Bottleneck**: Mixed bandwidth + compute
+- **Optimization**: Q4_0 quantization, ensure adequate GPU cores
+- **Expected**: 30-50 tok/s on M1 Pro (4B model)
+
+### Large Models (7B+)
+
+**Example**: LLaMA-7B, LLaMA-13B
+
+- **Bottleneck**: Compute-bound on smaller GPUs
+- **Optimization**: Use M1 Max/Ultra with 32+ GPU cores
+- **Expected**: 15-30 tok/s on M1 Max (7B model)
+
+<Note>
+  UNC currently performs better on small models (< 2B). Optimization for larger models is ongoing - see unc_resource_usage.md for details.
+</Note>
+
+## Benchmarking Your Setup
+
+### Basic Benchmark
+
+```bash
+# Compile with Q4_0
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama
+
+# Run benchmark (200 tokens)
+time unc run ./tinyllama.unc --prompt "The history of" --max-tokens 200
+```
+
+Calculate throughput:
+
+```
+tok/s = 200 tokens / elapsed_seconds
+```
+
+### Advanced Profiling
+
+Use macmon for detailed power/performance analysis:
+
+```bash
+# Install macmon (sudoless Apple Silicon monitoring)
+brew install vladkens/tap/macmon
+
+# Run with monitoring
+macmon --interval 200 &
+unc run ./tinyllama.unc --prompt "The history of" --max-tokens 200
+killall macmon
+```
+
+Analyze:
+- GPU power draw (expect 11-14W for decode)
+- GPU utilization (target 80-90%)
+- Temperature trends
+- Thermal throttling onset
+
+## Performance Comparison
+
+### UNC vs mlx-lm (TinyLlama 1.1B Q4_0)
+
+```
+UNC JIT:    ████████████████████████████████████████████████████████████  152 tok/s
+mlx-lm Q4:  ████████████████████████████████████████████                 113 tok/s
+```
+
+**UNC advantages**:
+- 1.35x faster decode
+- 25% less GPU power (11.3W vs 14.1W)
+- 8.4x fewer CPU instructions
+- 1.7x better energy efficiency
+
+**mlx-lm advantages**:
+- 4-5x lower memory usage (0.9 GB vs 4.2 GB)
+- Faster initialization for small models
+
+### UNC vs mlx-lm (Qwen3-4B Q4_0)
+
+```
+mlx-lm Q4:  ████████████████████████████████████████████████████  49.2 tok/s
+UNC Q4_0:   ██████████████████████████████████████████            38.7 tok/s
+```
+
+mlx-lm is 1.27x faster on this larger model. UNC optimization for 4B+ models is ongoing.
+
+## Common Performance Issues
+
+### Low Throughput (< 50% Expected)
+
+**Possible causes**:
+
+1. **Thermal throttling**: Check GPU temp with `sudo powermetrics --samplers gpu_power -i 1000`
+2. **Background processes**: Close other GPU-intensive apps
+3. **Incorrect quantization**: Ensure you're using Q4_0
+4. **Older hardware**: Verify your chip has sufficient bandwidth
+
+### High Memory Usage
+
+<Warning>
+  UNC loads BF16 weights and quantizes at init, causing 4-5x higher peak memory than mlx-lm.
+</Warning>
+
+**Workaround**: Ensure you have 16GB+ RAM for 1-4B models. Close other applications during compilation/initialization.
+
+### Inconsistent Performance
+
+Cold vs warm performance varies significantly due to thermal effects:
+
+```
+First 50 tokens:   152 tok/s (cold GPU)
+Tokens 100-200:    100-110 tok/s (thermal throttle)
+```
+
+This is expected behavior on sustained loads.
+
+## Future Optimizations
+
+Planned improvements:
+
+- **Flash Attention**: Reduce memory traffic in attention layers
+- **Grouped GEMM**: Better batching for MoE models
+- **Pre-quantized weight loading**: Eliminate BF16 → Q4_0 conversion at runtime
+- **Multi-GPU support**: Distribute large models across multiple GPUs
+
+## Next Steps
+
+- [Energy Efficiency](/guides/energy-efficiency) - Deep dive into power optimization
+- [Quantization Options](/guides/quantization-options) - Choose the right precision
+- [Model Compilation](/guides/model-compilation) - Understand the compilation pipeline

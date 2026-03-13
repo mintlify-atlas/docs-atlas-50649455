@@ -1,0 +1,321 @@
+---
+title: Quantization Options
+description: Compare F16, Q8_0, and Q4_0 quantization with real benchmark data and choose the right precision for your use case
+---
+
+# Quantization Options
+
+UNC supports multiple quantization levels to balance model quality, speed, and memory usage. Quantization is applied during compilation and permanently affects the compiled binary.
+
+## Overview
+
+Quantization reduces weight precision to decrease memory usage and increase throughput. UNC supports three quantization modes:
+
+| Quantization | Precision | Size (1.1B) | Speed (M1 Pro) | Use Case |
+|--------------|-----------|-------------|----------------|----------|
+| `f16` | 16-bit float | 2.2 GB | 47.9 tok/s | Maximum quality |
+| `q8-0` | 8-bit integer | 1.1 GB | 76.6 tok/s | Balanced |
+| `q4-0` | 4-bit integer | 0.6 GB | 152.0 tok/s | Maximum speed |
+
+<Tip>
+  For most use cases, Q4_0 provides the best performance with minimal quality degradation. Start with Q4_0 and only use higher precision if quality issues arise.
+</Tip>
+
+## F16: Full Precision
+
+**Flag**: `--quant f16`  
+**Description**: No quantization - weights stored as 16-bit floating point (half precision)
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant f16 -o ./tinyllama-f16
+```
+
+### Characteristics
+
+- **Size**: 2.2 GB for TinyLlama 1.1B (2 bytes per parameter)
+- **Speed**: 47.9 tok/s on M1 Pro (baseline)
+- **Quality**: Maximum - no precision loss
+- **Memory bandwidth**: ~200 GB/s utilization at peak
+
+### When to Use F16
+
+- Maximum quality is critical
+- Model shows degradation with quantization
+- You have abundant memory and slower inference is acceptable
+- Benchmarking and validation
+
+<Warning>
+  F16 is 3.2x slower than Q4_0 while using 3.7x more memory. Only use F16 when quality requirements justify the performance cost.
+</Warning>
+
+### Performance Data (TinyLlama 1.1B, M1 Pro)
+
+```
+Throughput:  47.9 tok/s
+Latency:     20.9 ms/tok
+Model size:  2.2 GB
+Peak memory: 4.2 GB
+Bandwidth:   ~97 GB/s (48% utilization)
+```
+
+## Q8_0: 8-Bit Quantization
+
+**Flag**: `--quant q8-0`  
+**Description**: Weights quantized to 8-bit integers with per-block scaling
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q8-0 -o ./tinyllama-q8
+```
+
+### Characteristics
+
+- **Size**: 1.1 GB for TinyLlama 1.1B (1 byte per parameter + overhead)
+- **Speed**: 76.6 tok/s on M1 Pro (1.6x faster than F16)
+- **Quality**: Near-lossless - minimal degradation
+- **Compression**: 2x smaller than F16
+
+### When to Use Q8_0
+
+- Balanced quality and performance
+- Quality-sensitive applications where Q4_0 degrades too much
+- 2x memory reduction is sufficient
+- Moderate speedup is acceptable (not maximum)
+
+### Performance Data (TinyLlama 1.1B, M1 Pro)
+
+```
+Throughput:  76.6 tok/s (1.6x faster than F16)
+Latency:     13.1 ms/tok
+Model size:  1.1 GB (50% of F16)
+Peak memory: 4.2 GB
+Speedup:     1.6x vs F16
+```
+
+### Quality Comparison
+
+<Note>
+  Q8_0 typically shows negligible quality degradation compared to F16. Perplexity increase is usually < 1%.
+</Note>
+
+## Q4_0: 4-Bit Quantization
+
+**Flag**: `--quant q4-0` (recommended)  
+**Description**: Weights quantized to 4-bit integers with per-block scaling
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama-q4
+```
+
+### Characteristics
+
+- **Size**: 0.6 GB for TinyLlama 1.1B (0.5 bytes per parameter + overhead)
+- **Speed**: 152.0 tok/s on M1 Pro (3.2x faster than F16)
+- **Quality**: High - acceptable degradation for most tasks
+- **Compression**: 3.7x smaller than F16
+
+### When to Use Q4_0
+
+- **Default choice** for most applications
+- Maximum throughput is required
+- Memory is limited (mobile, edge devices)
+- Quality degradation is acceptable (chat, general text generation)
+
+### Performance Data (TinyLlama 1.1B, M1 Pro)
+
+```
+Throughput:  152.0 tok/s (3.2x faster than F16)
+Latency:     6.36 ms/tok (cold), 8.3-10 ms/tok (warm)
+Model size:  0.6 GB (27% of F16)
+Peak memory: 4.2 GB
+GPU power:   11.3W (decode phase)
+Energy/tok:  74 mJ
+Speedup:     3.2x vs F16, 2.0x vs Q8_0
+```
+
+### Quality Characteristics
+
+Q4_0 quantization typically results in:
+
+- Perplexity increase: 2-5% (model dependent)
+- Minimal impact on chat and instruction-following tasks
+- Possible degradation on tasks requiring precise numerical reasoning
+- No significant impact on code generation (tested on coding benchmarks)
+
+## Comparative Benchmarks
+
+### TinyLlama 1.1B on M1 Pro
+
+Visual comparison:
+
+```
+Q4_0  ████████████████████████████████████████████████████████████  152.0 tok/s
+Q8_0  ███████████████████████████                                   76.6 tok/s
+F16   ███████████████████                                           47.9 tok/s
+```
+
+### Detailed Comparison Table
+
+| Metric | F16 | Q8_0 | Q4_0 |
+|--------|-----|------|------|
+| **Throughput** | 47.9 tok/s | 76.6 tok/s | 152.0 tok/s |
+| **Speedup** | 1.0x | 1.6x | 3.2x |
+| **Model size** | 2.2 GB | 1.1 GB | 0.6 GB |
+| **Compression** | 1.0x | 2.0x | 3.7x |
+| **Latency** | 20.9 ms/tok | 13.1 ms/tok | 6.36 ms/tok |
+| **GPU power** | ~15W | ~13W | 11.3W |
+| **Energy/token** | ~125 mJ | ~100 mJ | 74 mJ |
+| **Quality** | 100% | ~99% | ~95-98% |
+
+### Qwen3-4B on M1 Pro (Q4_0 Only)
+
+```bash
+unc compile --model Qwen/Qwen3-4B --quant q4-0 -o ./qwen3
+```
+
+```
+UNC Q4_0:    38.7 tok/s
+Latency:     22.9-23.0 ms/tok
+Model size:  ~2.26 GB
+Dispatches:  ~399 per decode
+```
+
+## Energy Efficiency Comparison
+
+UNC Q4_0 vs mlx-lm Q4 (TinyLlama 1.1B, measured via macmon):
+
+| Metric | UNC Q4_0 | mlx-lm Q4 |
+|--------|----------|----------|
+| Throughput | 152 tok/s | 113 tok/s |
+| GPU power (decode) | 11.3W | 14.1W |
+| Energy per token | 74 mJ | 125 mJ |
+| **Tokens per Wh** | **12,800** | **8,000** |
+| Efficiency gain | **1.7x** | 1.0x |
+
+<Tip>
+  UNC Q4_0 delivers 1.7x better energy efficiency than mlx-lm while being 1.35x faster. This translates to longer battery life on MacBooks and lower heat generation.
+</Tip>
+
+## How Quantization Works
+
+### Block Quantization
+
+Both Q8_0 and Q4_0 use block-based quantization:
+
+<Steps>
+  <Step title="Group weights into blocks">
+    Weights are divided into blocks (typically 32-256 values per block)
+  </Step>
+
+  <Step title="Compute per-block scaling factor">
+    Each block gets a scaling factor to preserve dynamic range:
+    
+    ```
+    scale = max(abs(block)) / max_quant_value
+    ```
+  </Step>
+
+  <Step title="Quantize each value">
+    ```
+    quantized_value = round(original_value / scale)
+    ```
+  </Step>
+
+  <Step title="Store quantized values + scales">
+    Scales are stored as F16, quantized values as 4-bit or 8-bit integers
+  </Step>
+</Steps>
+
+### Dequantization at Runtime
+
+During inference, values are dequantized on-the-fly:
+
+```
+float_value = quantized_value * scale
+```
+
+This happens in Metal shaders before matrix multiplication, adding minimal overhead.
+
+## Memory Usage
+
+<Warning>
+  UNC currently loads weights in BF16/F16 and quantizes at initialization. Peak memory usage reflects the full-precision weights, even though the final runtime uses quantized weights.
+</Warning>
+
+### Memory Profile (TinyLlama 1.1B Q4_0)
+
+```
+Peak RSS:        4.24 GB (during init)
+Runtime memory:  ~1 GB (after quantization)
+Q4_0 weights:    618 MB (GPU)
+Activations:     ~200 MB
+KV cache:        ~100 MB (depends on context length)
+```
+
+Compare to mlx-lm:
+
+```
+mlx-lm Q4 peak:  0.87 GB (4-5x less)
+```
+
+mlx-lm's lower memory usage comes from loading pre-quantized weights directly.
+
+## Choosing the Right Quantization
+
+### Decision Tree
+
+```
+Do you need maximum quality?
+├─ Yes → Use F16
+└─ No
+   |
+   Is quality very important?
+   ├─ Yes → Use Q8_0
+   └─ No → Use Q4_0 (recommended)
+```
+
+### Recommendation by Use Case
+
+| Use Case | Recommended | Rationale |
+|----------|-------------|----------|
+| Chat / Assistants | Q4_0 | Speed matters, quality degradation minimal |
+| Code generation | Q4_0 | Tested stable on coding tasks |
+| Creative writing | Q8_0 | Better quality for nuanced text |
+| Summarization | Q4_0 | Speed valuable, summaries robust |
+| Translation | Q8_0 | Precision important for accuracy |
+| Research / benchmarking | F16 | Need baseline quality |
+| Edge / mobile | Q4_0 | Memory constrained |
+
+## Compiling with Quantization
+
+### Basic Usage
+
+```bash
+# Q4_0 (default recommendation)
+unc compile --model <model-name> --quant q4-0 -o ./model-q4
+
+# Q8_0 (balanced)
+unc compile --model <model-name> --quant q8-0 -o ./model-q8
+
+# F16 (full precision)
+unc compile --model <model-name> --quant f16 -o ./model-f16
+```
+
+### Testing Different Quantizations
+
+```bash
+# Compile all three versions
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama-q4
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q8-0 -o ./tinyllama-q8
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant f16 -o ./tinyllama-f16
+
+# Compare outputs
+unc run ./tinyllama-q4.unc --prompt "Write a story about" --max-tokens 200
+unc run ./tinyllama-q8.unc --prompt "Write a story about" --max-tokens 200
+unc run ./tinyllama-f16.unc --prompt "Write a story about" --max-tokens 200
+```
+
+## Next Steps
+
+- [Performance Tuning](/guides/performance-tuning) - Maximize throughput
+- [Energy Efficiency](/guides/energy-efficiency) - Optimize power usage
+- [Model Compilation](/guides/model-compilation) - Learn the compilation process

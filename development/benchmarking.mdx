@@ -1,0 +1,300 @@
+---
+title: "Benchmarking"
+description: "How to run performance benchmarks and measure UNC's resource usage"
+---
+
+UNC includes comprehensive benchmarks measuring throughput, latency, power consumption, and memory usage on Apple Silicon.
+
+## Benchmark Structure
+
+Benchmark results are organized by model in the `benchmark/` directory:
+
+```
+benchmark/
+  tinyllama/
+    results.md    TinyLlama 1.1B benchmark data
+  qwen3/
+    results.md    Qwen3-4B benchmark data
+```
+
+Each benchmark report includes:
+- Throughput (tokens/second)
+- Decode latency (ms/token)
+- GPU/CPU/SoC power consumption
+- Energy efficiency (mJ/token, tokens/Wh)
+- Memory usage (RSS, footprint)
+- CPU instruction counts
+- Thermal characteristics
+
+## Running Benchmarks
+
+<Steps>
+
+### 1. Build UNC
+
+Always use release builds for accurate measurements:
+
+```bash
+cargo build --release
+```
+
+### 2. Compile a Model
+
+Compile the model you want to benchmark:
+
+<CodeGroup>
+
+```bash TinyLlama 1.1B (Q4_0)
+./target/release/unc compile \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --quant q4-0 \
+  -o ./tinyllama.unc
+```
+
+```bash Qwen3-4B (Q4_0)
+./target/release/unc compile \
+  --model Qwen/Qwen3-4B \
+  --quant q4-0 \
+  -o ./qwen3.unc
+```
+
+```bash AOT Binary (Standalone)
+./target/release/unc compile \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --quant q4-0 \
+  --binary \
+  -o ./tinyllama
+```
+
+</CodeGroup>
+
+### 3. Run Inference
+
+Generate tokens to measure throughput:
+
+```bash
+./target/release/unc run ./tinyllama.unc \
+  --prompt "The history of" \
+  --max-tokens 200
+```
+
+**Output includes:**
+- Generated text
+- Throughput (tokens/second)
+- Decode latency (ms/token)
+- Total time
+
+### 4. Measure Power Consumption (Optional)
+
+Use `macmon` for real-time power monitoring on Apple Silicon:
+
+```bash
+# Install macmon (sudoless power monitoring)
+brew install vladkens/tap/macmon
+
+# Run with power sampling (200ms intervals)
+macmon -s 200 -- ./target/release/unc run ./tinyllama.unc \
+  --prompt "The history of" \
+  --max-tokens 200
+```
+
+**macmon output:**
+- GPU power (W)
+- CPU power (W)
+- SoC power (W)
+- GPU utilization (%)
+- GPU temperature (°C)
+
+</Steps>
+
+## Benchmark Metrics
+
+### Throughput and Latency
+
+**Throughput:** Tokens generated per second during sustained decode phase.
+
+**Measured on Apple M1 Pro:**
+
+| Model | Precision | Throughput | Decode Latency |
+|-------|-----------|------------|----------------|
+| TinyLlama 1.1B | Q4_0 | 152 tok/s | 6.36 ms/tok |
+| TinyLlama 1.1B | Q8_0 | 76.6 tok/s | — |
+| TinyLlama 1.1B | F16 | 47.9 tok/s | — |
+| Qwen3-4B | Q4_0 | 38.7 tok/s | 22.9 ms/tok |
+
+### Energy Efficiency
+
+UNC achieves **1.7x better energy efficiency** than mlx-lm on TinyLlama Q4_0:
+
+| Metric | UNC Metal | mlx-lm Q4 |
+|--------|-----------|----------|
+| Throughput | 152 tok/s | 113 tok/s |
+| GPU power (decode) | 11.3W | 14.1W |
+| Energy per token | 74 mJ | 125 mJ |
+| Tokens per watt-hour | 12,800 | 8,000 |
+
+<Note>
+Energy measurements use GPU power only during the decode phase (identified by GPU utilization > 50%).
+</Note>
+
+### CPU Overhead
+
+UNC's compiled approach eliminates Python runtime overhead:
+
+| Metric | UNC JIT | UNC AOT | mlx-lm Q4 |
+|--------|---------|---------|----------|
+| Instructions retired (200 tok) | 5.3B | 3.8B | 31.4B |
+| User CPU time | 0.30s | 0.16s | 3.27s |
+| Context switches | ~4,000 | ~6,200 | ~15,700 |
+
+**UNC uses 8.4x fewer CPU instructions** — no Python/framework dispatch overhead.
+
+### Memory Usage
+
+| Metric | UNC JIT | UNC AOT | mlx-lm Q4 |
+|--------|---------|---------|----------|
+| Peak RSS | 4.24 GB | 4.11 GB | 0.87 GB |
+| Q4_0 weights (GPU) | 618 MB | 618 MB | ~618 MB |
+
+mlx-lm uses **4-5x less memory** — UNC loads BF16 weights then quantizes at initialization.
+
+### Thermal Behavior
+
+**TinyLlama 1.1B Q4_0 on M1 Pro:**
+
+- GPU temp (idle): 66-70°C
+- GPU temp (decode): 70-75°C
+- Throttling onset: ~100-150 tokens
+- Cold → warm throughput drop: 30-40% (152 → 100-110 tok/s)
+
+**Explanation:** Sustained high GPU utilization (88%) causes thermal throttling after ~100 tokens.
+
+## Comparing with mlx-lm
+
+To benchmark against mlx-lm:
+
+<Steps>
+
+### 1. Install mlx-lm
+
+```bash
+pip install mlx-lm
+```
+
+### 2. Run mlx-lm Inference
+
+```bash
+mlx_lm.generate \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --prompt "The history of" \
+  --max-tokens 200 \
+  --quantize q4
+```
+
+### 3. Compare Results
+
+**TinyLlama 1.1B Q4_0:**
+
+```
+UNC Q4_0  ████████████████████████████████████████████████████████████  152.0 tok/s
+mlx-lm Q4 ████████████████████████████████████████████                 112.7 tok/s
+```
+
+**Qwen3-4B Q4_0:**
+
+```
+mlx-lm Q4 ████████████████████████████████████████████████████  49.2 tok/s
+UNC Q4_0  ██████████████████████████████████████████            38.7 tok/s
+```
+
+</Steps>
+
+<Note>
+UNC is **1.35x faster** on TinyLlama but **79%** of mlx-lm on Qwen3-4B due to extra QKNorm dispatches and barrier overhead (see `benchmark/qwen3/results.md`).
+</Note>
+
+## Detailed Resource Report
+
+The full methodology and power traces are documented in:
+
+```
+unc_resource_usage.md
+```
+
+This report includes:
+- Hardware specifications (Apple M1 Pro, 14 GPU cores, 16GB, 200 GB/s)
+- Measurement methodology (macmon 200ms sampling, /usr/bin/time -l)
+- Power traces (GPU/CPU/SoC wattage during decode)
+- Bandwidth utilization (~97 GB/s effective, 48% of peak)
+- JIT vs AOT comparison (GPU power identical, AOT uses +1W CPU for mmap)
+
+## Benchmark Reproduction
+
+### Hardware Requirements
+
+- Apple Silicon Mac (M1/M2/M3 series)
+- macOS 12.0 or later
+- 16GB+ RAM recommended for 4B+ parameter models
+
+### Measurement Tools
+
+<CodeGroup>
+
+```bash macmon (Power)
+# Install sudoless Apple Silicon power monitor
+brew install vladkens/tap/macmon
+
+# Run with 200ms sampling
+macmon -s 200 -- <command>
+```
+
+```bash time (CPU/Memory)
+# Built-in macOS tool
+/usr/bin/time -l <command>
+```
+
+</CodeGroup>
+
+### Methodology
+
+1. **Cooldown:** Wait 15-30s between runs to reach baseline temperature
+2. **Prompt:** Use consistent prompt ("The history of") across runs
+3. **Length:** Generate 200 tokens per run
+4. **Phase identification:** Decode phase = GPU utilization > 50%
+5. **Power sampling:** 200ms intervals via macmon
+6. **Metrics:** Average GPU/CPU/SoC power during decode phase only
+
+## Interpreting Results
+
+### Cold vs Warm Performance
+
+**Cold (first run):** GPU at baseline temp, no thermal throttling
+- TinyLlama Q4_0: **152 tok/s**
+
+**Warm (sustained):** GPU thermally saturated, throttling active
+- TinyLlama Q4_0: **100-110 tok/s** (30-40% slower)
+
+<Note>
+Benchmark the **first 50-100 tokens** for peak "cold" performance, or measure after **150+ tokens** for sustained "warm" throughput.
+</Note>
+
+### Bandwidth Utilization
+
+**Q4_0 TinyLlama 1.1B:**
+- Weights per token: 618 MB
+- Decode latency: 6.36 ms/tok
+- Effective bandwidth: ~97 GB/s
+- Utilization: **48%** of M1 Pro's 200 GB/s
+
+UNC is **memory-bandwidth bound** on small models — larger batch sizes would increase utilization.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Project Structure" icon="folder-tree" href="/development/project-structure">
+    Explore UNC's codebase organization
+  </Card>
+  <Card title="Building from Source" icon="hammer" href="/development/building-from-source">
+    Compile UNC locally with Rust and Xcode tools
+  </Card>
+</CardGroup>
